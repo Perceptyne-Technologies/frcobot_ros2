@@ -4,6 +4,8 @@
 #include "stdlib.h"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp/service.hpp"
+#include "rclcpp_action/rclcpp_action.hpp"
+#include "control_msgs/action/follow_joint_trajectory.hpp"
 #include "fairino_msgs/srv/remote_script_content.hpp"
 #include "fairino_msgs/srv/remote_cmd_interface.hpp"
 #include "fairino_msgs/msg/robot_nonrt_state.hpp"
@@ -16,11 +18,16 @@
 #include "arpa/inet.h"
 #include "fcntl.h"
 #include <regex>
+#include <algorithm>
 #include "data_type_def.h"
 #include <queue>
 #include "libfairino/include/robot.h"
 #include <atomic>
 #include "semaphore.h"
+#include <mutex>
+#include "sensor_msgs/msg/joint_state.hpp"
+#include "trajectory_msgs/msg/joint_trajectory_point.hpp"
+#include "std_msgs/msg/empty.hpp"
 
 using remote_cmd_server_srv_msg = fairino_msgs::srv::RemoteCmdInterface;
 using remote_script_srv_msg = fairino_msgs::srv::RemoteScriptContent;
@@ -33,7 +40,7 @@ class robot_command_thread:public rclcpp::Node{
 public:
     robot_command_thread(const std::string node_name);
     ~robot_command_thread();
-    
+
     //点位信息设置类
     std::string defJntPosition(std::string pos);
     std::string defCartPosition(std::string pos);
@@ -89,7 +96,7 @@ public:
     //外设控制
     std::string ActGripper(std::string para);
     std::string MoveGripper(std::string para);
-    
+
     //IO控制
     std::string SetDO(std::string para);
     std::string SetToolDO(std::string para);
@@ -170,7 +177,7 @@ public:
     std::string TractorMoveL(std::string para);
     std::string TractorMoveC(std::string para);
     std::string TractorStop(std::string para);
-    
+
     //轨迹J功能
     std::string TrajectoryJUpLoad(std::string para);
     std::string TrajectoryJDelete(std::string para);
@@ -199,7 +206,7 @@ public:
     std::string WeldingGetReWeldAfterBreakOffParam(std::string para);
     std::string WeldingStartReWeldAfterBreakOff(std::string para);
     std::string WeldingAbortWeldAfterBreakOff(std::string para);
-    
+
 
     //new-387
     std::string GetAxlePointRecordBtnState(std::string para);
@@ -569,18 +576,18 @@ public:
     std::string SetStandardDOLevel(std::string para);
     std::string GetStandardDOLevel(std::string para);
     std::string SetExAxisCmdDoneTime(std::string para);
-    std::string OpenLuaDownload(std::string para);    
-    std::string ExtDevGetUDPComParam(std::string para); 
-    std::string ExtDevSetUDPComParam(std::string para); 
-    std::string SetRobotPosToAxis(std::string para); 
-    std::string ExtAxisParamConfig(std::string para); 
+    std::string OpenLuaDownload(std::string para);
+    std::string ExtDevGetUDPComParam(std::string para);
+    std::string ExtDevSetUDPComParam(std::string para);
+    std::string SetRobotPosToAxis(std::string para);
+    std::string ExtAxisParamConfig(std::string para);
     std::string WeldingSetCurrentRelation(std::string para);
     std::string WeldingSetVoltageRelation(std::string para);
     std::string ARCStart(std::string para);
     std::string ARCEnd(std::string para);
     std::string SetForwardWireFeed(std::string para);
     std::string SetReverseWireFeed(std::string para);
-    std::string ArcWeldTraceAIChannelCurrent(std::string para); 
+    std::string ArcWeldTraceAIChannelCurrent(std::string para);
     std::string ArcWeldTraceAIChannelVoltage(std::string para);
     std::string ArcWeldTraceCurrentPara(std::string para);
     std::string ArcWeldTraceVoltagePara(std::string para);
@@ -619,7 +626,7 @@ public:
 
 private:
 
-    
+
     void _state_recv_callback();
     rclcpp::Publisher<robot_feedback_msg>::SharedPtr _state_publisher;//进程内通信，用于发送状态数据字符串
     rclcpp::TimerBase::SharedPtr _locktimer1;
@@ -666,6 +673,62 @@ private:
     std::vector<JointPos> _cmd_jnt_pos_list;//存储关节数据点
     std::vector<DescPose> _cmd_cart_pos_list;//存储笛卡尔数据点
     std::string _controller_ip;
+
+    // --- Velocity bridge members ---
+    void _vel_bridge_joint_state_cb(const sensor_msgs::msg::JointState::SharedPtr msg);
+    void _vel_bridge_cmd_cb(const trajectory_msgs::msg::JointTrajectoryPoint::SharedPtr msg);
+    void _vel_bridge_hold_cb(const std_msgs::msg::Empty::SharedPtr msg);
+    void _vel_bridge_control_loop();
+
+    rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr _vel_bridge_joint_state_sub_;
+    rclcpp::Subscription<trajectory_msgs::msg::JointTrajectoryPoint>::SharedPtr _vel_bridge_cmd_sub_;
+    rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr _vel_bridge_hold_sub_;
+    rclcpp::TimerBase::SharedPtr _vel_bridge_timer_;
+
+    double _vel_bridge_current_pos_[6] = {0.0};        // degrees
+    double _vel_bridge_joint_state_pos_[6] = {0.0};     // degrees, from /joint_states
+    double _vel_bridge_dt_ = 0.008;
+    double _vel_bridge_watchdog_timeout_ = 0.5;  // seconds without command = stop
+    rclcpp::Time _vel_bridge_last_cmd_time_;
+    bool _vel_bridge_got_joint_state_ = false;
+    bool _vel_bridge_has_cmd_ = false;
+    trajectory_msgs::msg::JointTrajectoryPoint _vel_bridge_latest_cmd_;
+    std::mutex _vel_bridge_mutex_;
+    std::string _vel_bridge_cmd_topic_;
+    std::string _vel_bridge_hold_topic_;
+
+    // Diagnostics logging
+    rclcpp::Time _vel_bridge_last_log_time_;
+    rclcpp::Time _vel_bridge_last_loop_time_;
+    double _vel_bridge_measured_dt_ = 0.0;
+    int _vel_bridge_loop_count_ = 0;
+    double _vel_bridge_max_deg_step_[6] = {0.0};
+    // ------------------------------
+
+    // --- Trajectory action server (ServoJ streaming) ---
+    using FollowJT = control_msgs::action::FollowJointTrajectory;
+    using GoalHandleFollowJT = rclcpp_action::ServerGoalHandle<FollowJT>;
+
+    rclcpp_action::Server<FollowJT>::SharedPtr _traj_action_server_;
+    std::vector<JointPos> _traj_waypoints_;   // degrees (original from trajectory msg)
+    std::vector<int> _traj_times_;             // ms from start (original)
+    rclcpp::TimerBase::SharedPtr _traj_timer_;
+    std::shared_ptr<GoalHandleFollowJT> _traj_goal_handle_;
+    size_t _traj_idx_ = 0;
+    bool _traj_executing_ = false;
+    rclcpp::Time _traj_start_time_;             // wall clock when execution began
+    double _traj_total_duration_s_ = 0.0;       // total trajectory duration from times
+    double _traj_cmd_dt_ = 0.001;                // ServoJ cmdT / timer period (seconds)
+
+    rclcpp_action::GoalResponse _traj_handle_goal(
+        const rclcpp_action::GoalUUID & uuid,
+        std::shared_ptr<const FollowJT::Goal> goal);
+    rclcpp_action::CancelResponse _traj_handle_cancel(
+        const std::shared_ptr<GoalHandleFollowJT> goal_handle);
+    void _traj_handle_accepted(const std::shared_ptr<GoalHandleFollowJT> goal_handle);
+    void _traj_control_loop();
+    // ------------------------------
+
     const std::map<std::string,std::string(robot_command_thread::*)(std::string)> _fr_function_list{
     {"JNTPoint",&robot_command_thread::defJntPosition},
     {"CARTPoint",&robot_command_thread::defCartPosition},
@@ -758,7 +821,7 @@ private:
     {"AuxServoClearError", &robot_command_thread::AuxServoClearError},
     {"AuxServoSetStatusID", &robot_command_thread::AuxServoSetStatusID},
     {"GetTCPOffset",&robot_command_thread::GetTCPOffset},
-    {"GetDHCompensation",&robot_command_thread::GetDHCompensation}, 
+    {"GetDHCompensation",&robot_command_thread::GetDHCompensation},
     {"TractorEnable",&robot_command_thread::TractorEnable},
     {"TractorHoming",&robot_command_thread::TractorHoming},
     {"TractorMoveL",&robot_command_thread::TractorMoveL},

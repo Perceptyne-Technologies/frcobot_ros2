@@ -22,6 +22,6 @@ V3.0.5 新增reconnect_flag反馈
 #define VERSION_MSG_MINOR 0
 #define VERSION_MSG_MINOR2 5
 
-#define CHN_VERSION
-//#define ENG_VERSION
+//#define CHN_VERSION
+#define ENG_VERSION
 #endif

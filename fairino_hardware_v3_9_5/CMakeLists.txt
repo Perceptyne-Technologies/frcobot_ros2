@@ -12,7 +12,11 @@ set(CMAKE_CXX_STANDARD 17)
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_action REQUIRED)
+find_package(control_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(trajectory_msgs REQUIRED)
 find_package(hardware_interface REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
@@ -25,12 +29,12 @@ file(GLOB SRC_DIR ./src/command_server.cpp ./src/command_server_node.cpp ./src/C
 file(GLOB EXP_SRC_DIR ./examples/src/*.cpp)
 
 #compile
-# file(CREATE_LINK 
+# file(CREATE_LINK
 # "${CMAKE_CURRENT_SOURCE_DIR}/libfairino/lib/libfairino.so.2.3.0"
 # "${CMAKE_CURRENT_SOURCE_DIR}/libfairino/lib/libfairino.so.2"
 # SYMBOLIC)
 
-# file(CREATE_LINK 
+# file(CREATE_LINK
 # "${CMAKE_CURRENT_SOURCE_DIR}/libfairino/lib/libfairino.so.2"
 # "${CMAKE_CURRENT_SOURCE_DIR}/libfairino/lib/libfairino.so"
 # SYMBOLIC)
@@ -38,8 +42,8 @@ file(GLOB EXP_SRC_DIR ./examples/src/*.cpp)
 add_executable(ros2_cmd_server ${SRC_DIR})
 add_executable(srv_test_client ${EXP_SRC_DIR})
 add_library(
-  fairino_hardware 
-  SHARED 
+  fairino_hardware
+  SHARED
   ./src/fairino_hardware_interface.cpp
 )
 
@@ -48,12 +52,12 @@ add_library(
 
 
 #add headfile source
-target_include_directories(ros2_cmd_server PUBLIC 
-${CMAKE_CURRENT_SOURCE_DIR}/include/ 
+target_include_directories(ros2_cmd_server PUBLIC
+${CMAKE_CURRENT_SOURCE_DIR}/include/
 ${CMAKE_CURRENT_SOURCE_DIR}/)
 
 target_include_directories(srv_test_client PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/examples/include)
-target_include_directories(fairino_hardware PUBLIC 
+target_include_directories(fairino_hardware PUBLIC
 $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/>
 $<INSTALL_INTERFACE:include/fairino_hardware>
@@ -68,16 +72,21 @@ target_link_libraries(ros2_cmd_server "-Wl,-rpath,$ORIGIN" ${CMAKE_CURRENT_SOURC
 target_link_libraries(fairino_hardware "-Wl,-rpath,$ORIGIN" ${CMAKE_CURRENT_SOURCE_DIR}/libfairino/lib/libfairino.so.2.3.5)
 
 #add dependencies
-ament_target_dependencies(ros2_cmd_server rclcpp fairino_msgs)
+ament_target_dependencies(ros2_cmd_server rclcpp rclcpp_action control_msgs fairino_msgs sensor_msgs trajectory_msgs std_msgs)
 ament_target_dependencies(srv_test_client rclcpp fairino_msgs)
-ament_target_dependencies(fairino_hardware 
+ament_target_dependencies(fairino_hardware
   hardware_interface
   pluginlib
   rclcpp
   fairino_msgs
-  rclcpp_lifecycle 
+  rclcpp_lifecycle
 )
 
+add_executable(state_bridge src/state_bridge_node.cpp)
+target_include_directories(state_bridge PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include/
+  ${CMAKE_CURRENT_SOURCE_DIR}/)
+ament_target_dependencies(state_bridge rclcpp sensor_msgs fairino_msgs)
 
 #export hardware plugins
 pluginlib_export_plugin_description_file(hardware_interface fairino_hardware.xml)
@@ -93,6 +102,11 @@ install(TARGETS srv_test_client
   DESTINATION lib/${PROJECT_NAME}
 )
 
+#state bridge
+install(TARGETS state_bridge
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 #ros2_control hardware
 install(TARGETS fairino_hardware
   EXPORT fairino_hardware
@@ -101,22 +115,22 @@ install(TARGETS fairino_hardware
 )
 
 #copy fairino SDK lib file to specfic path
-file(MAKE_DIRECTORY 
+file(MAKE_DIRECTORY
 "${CMAKE_INSTALL_PREFIX}/lib/${PROJECT_NAME}"
 )
 
-file(COPY_FILE "libfairino/lib/libfairino.so.2.3.5" 
-"${CMAKE_INSTALL_PREFIX}/lib/libfairino.so.2.3.5" 
+file(COPY_FILE "libfairino/lib/libfairino.so.2.3.5"
+"${CMAKE_INSTALL_PREFIX}/lib/libfairino.so.2.3.5"
 )
 
-# file(CREATE_LINK 
-# "${CMAKE_INSTALL_PREFIX}/lib/libfairino.so.2.3.0" 
-# "${CMAKE_INSTALL_PREFIX}/lib/libfairino.so.2" 
+# file(CREATE_LINK
+# "${CMAKE_INSTALL_PREFIX}/lib/libfairino.so.2.3.0"
+# "${CMAKE_INSTALL_PREFIX}/lib/libfairino.so.2"
 # SYMBOLIC)
 
-# file(CREATE_LINK 
-# "${CMAKE_INSTALL_PREFIX}/lib/libfairino.so.2" 
-# "${CMAKE_INSTALL_PREFIX}/lib/libfairino.so" 
+# file(CREATE_LINK
+# "${CMAKE_INSTALL_PREFIX}/lib/libfairino.so.2"
+# "${CMAKE_INSTALL_PREFIX}/lib/libfairino.so"
 # SYMBOLIC)
 
 

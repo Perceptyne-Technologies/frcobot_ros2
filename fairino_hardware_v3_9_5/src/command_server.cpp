@@ -3,6 +3,8 @@
 #include <sys/socket.h>
 #include "fairino_hardware/version_control.h"
 #include "sys/mman.h"
+#include <algorithm>
+#include <cmath>
 
 std::atomic_bool _reconnect_flag;
 std::atomic<int> mainerrcode;
@@ -370,7 +372,7 @@ robot_command_thread::robot_command_thread(const std::string node_name):rclcpp::
         }
         if(connect_count == _connect_retry_SDK){
             RCLCPP_ERROR(rclcpp::get_logger(LOGGER_NAME),msgout[msg_id(connect_failed)]);
-            exit(0);  
+            exit(0);
         }
     }
 
@@ -378,9 +380,61 @@ robot_command_thread::robot_command_thread(const std::string node_name):rclcpp::
     RCLCPP_INFO(rclcpp::get_logger(LOGGER_NAME),msgout[msg_id(connect_success)]);
     /*********************************************************************************************/
      _state_publisher = this->create_publisher<robot_feedback_msg>("nonrt_state_data",1);
-    _locktimer1 = this->create_wall_timer(10ms,std::bind(&robot_command_thread::_state_recv_callback,this));//创建一个定时器任务用于获取非实时状态数据,触发间隔为100ms
-    _locktimer2 = this->create_wall_timer(100ms,std::bind(&robot_command_thread::_ping_recv_callback,this));//创建一个定时器任务用于ping机器人,触发间隔为100ms
-}
+     _locktimer1 = this->create_wall_timer(10ms,std::bind(&robot_command_thread::_state_recv_callback,this));//创建一个定时器任务用于获取非实时状态数据,触发间隔为100ms
+     _locktimer2 = this->create_wall_timer(100ms,std::bind(&robot_command_thread::_ping_recv_callback,this));//创建一个定时器任务用于ping机器人,触发间隔为100ms
+
+     // --- Velocity bridge init ---
+     declare_parameter<std::string>("robot_name", "fr5");
+     declare_parameter<double>("velocity_command_freq", 125.0);
+
+     std::string robot_name = get_parameter("robot_name").as_string();
+     double freq = get_parameter("velocity_command_freq").as_double();
+     _vel_bridge_dt_ = 1.0 / freq;
+     _vel_bridge_cmd_topic_ = robot_name + "/command_move";
+     _vel_bridge_hold_topic_ = robot_name + "/hold_robot";
+
+     // Read initial joint positions
+     JointPos initial_pos;
+     _ptr_robot->GetActualJointPosDegree(0, &initial_pos);
+     for (int i = 0; i < 6; i++) {
+       _vel_bridge_current_pos_[i] = initial_pos.jPos[i];
+     }
+     RCLCPP_INFO(get_logger(), "Velocity bridge initial positions (deg): %.2f %.2f %.2f %.2f %.2f %.2f",
+                 _vel_bridge_current_pos_[0], _vel_bridge_current_pos_[1], _vel_bridge_current_pos_[2],
+                 _vel_bridge_current_pos_[3], _vel_bridge_current_pos_[4], _vel_bridge_current_pos_[5]);
+
+     // Start the UDP servo stream (velocity bridge uses UDP)
+     _ptr_robot->ServoMoveStart(/*comType=*/1);
+
+     // Subscriptions
+     _vel_bridge_joint_state_sub_ = create_subscription<sensor_msgs::msg::JointState>(
+       "/joint_states", rclcpp::QoS(2),
+       std::bind(&robot_command_thread::_vel_bridge_joint_state_cb, this, std::placeholders::_1));
+
+     _vel_bridge_cmd_sub_ = create_subscription<trajectory_msgs::msg::JointTrajectoryPoint>(
+       _vel_bridge_cmd_topic_, rclcpp::QoS(2),
+       std::bind(&robot_command_thread::_vel_bridge_cmd_cb, this, std::placeholders::_1));
+
+     _vel_bridge_hold_sub_ = create_subscription<std_msgs::msg::Empty>(
+       _vel_bridge_hold_topic_, rclcpp::QoS(1),
+       std::bind(&robot_command_thread::_vel_bridge_hold_cb, this, std::placeholders::_1));
+
+     // Control timer
+     auto dt_ms = std::chrono::milliseconds(static_cast<int>(1000.0 / freq));
+     _vel_bridge_timer_ = create_wall_timer(
+       dt_ms, std::bind(&robot_command_thread::_vel_bridge_control_loop, this));
+
+     RCLCPP_INFO(get_logger(), "Velocity bridge started — %s at %.1f Hz", _vel_bridge_cmd_topic_.c_str(), freq);
+
+     // --- Trajectory action server ---
+     _traj_action_server_ = rclcpp_action::create_server<FollowJT>(
+         this, "fairino5_controller/follow_joint_trajectory",
+         std::bind(&robot_command_thread::_traj_handle_goal, this, std::placeholders::_1, std::placeholders::_2),
+         std::bind(&robot_command_thread::_traj_handle_cancel, this, std::placeholders::_1),
+         std::bind(&robot_command_thread::_traj_handle_accepted, this, std::placeholders::_1));
+
+     RCLCPP_INFO(get_logger(), "Trajectory action server started — fairino5_controller/follow_joint_trajectory");
+ }
 
 
 /**
@@ -388,8 +442,9 @@ robot_command_thread::robot_command_thread(const std::string node_name):rclcpp::
  */
 robot_command_thread::~robot_command_thread()
 {
-    //_ptr_robot->CloseRPC();
-    _ptr_robot->~FRRobot();
+    // End the servo stream
+    _ptr_robot->ServoMoveEnd(/*comType=*/1);
+    _ptr_robot->CloseRPC();
 }
 
 
@@ -398,7 +453,7 @@ robot_command_thread::~robot_command_thread()
  * @brief 私有函数，service的回调函数，用于解析字符串指令，跳转对应的处理函数
  */
 void robot_command_thread::_parseROSCommandData_callback(
-        const std::shared_ptr<remote_cmd_server_srv_msg::Request> req,\ 
+        const std::shared_ptr<remote_cmd_server_srv_msg::Request> req,\
         std::shared_ptr<remote_cmd_server_srv_msg::Response> res){
     //指令格式为movj(1,10)
     std::regex func_reg("([A-Z|a-z|_|0-9]+)[(](.*)[)]");//函数名的输入模式应该是字母或者数字函数名后跟(),圆括号中有所有输入参数
@@ -448,13 +503,13 @@ void robot_command_thread::_parseROSCommandData_callback(
 /**
  * @brief 私有函数，用于按逗号分割字符串并存储入std::list容器中
  * @param [in] str-需要进行风格的字符串
- * @param [out] list_data-输出的按逗号风格出来的字符串列表 
+ * @param [out] list_data-输出的按逗号风格出来的字符串列表
  */
 void robot_command_thread::_splitString2List(std::string str,std::list<std::string> &list_data){
     list_data.clear();
     std::regex search_para(",");//分隔符
     std::regex_token_iterator iter_data(str.begin(),str.end(),search_para,-1);
-    std::regex_token_iterator<std::string::iterator> end; 
+    std::regex_token_iterator<std::string::iterator> end;
     while(iter_data != end){
         list_data.push_back(iter_data->str());
         iter_data++;
@@ -464,13 +519,13 @@ void robot_command_thread::_splitString2List(std::string str,std::list<std::stri
 /**
  * @brief 私有函数，用于按逗号分割字符串并存储入std::vector容器中
  * @param [in] str-需要进行风格的字符串
- * @param [out] list_data-输出的按逗号风格出来的字符串列表 
+ * @param [out] list_data-输出的按逗号风格出来的字符串列表
  */
 void robot_command_thread::_splitString2Vec(std::string str,std::vector<std::string> &vector_data){
     vector_data.clear();
     std::regex search_para(",");//分隔符
     std::regex_token_iterator iter_data(str.begin(),str.end(),search_para,-1);
-    std::regex_token_iterator<std::string::iterator> end; 
+    std::regex_token_iterator<std::string::iterator> end;
     while(iter_data != end){
         vector_data.push_back(iter_data->str());
         iter_data++;
@@ -688,7 +743,7 @@ std::string  robot_command_thread::DragTeachSwitch(std::string para){
  * @brief 机械臂使能
  * @param [in] para-使能开关,0-disable,1-enable
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string  robot_command_thread::RobotEnable(std::string para){
     return std::to_string(_ptr_robot->RobotEnable(std::stoi(para)));
@@ -698,7 +753,7 @@ std::string  robot_command_thread::RobotEnable(std::string para){
  * @brief 机械臂手动/自动模式切换
  * @param [in] para-模式设置
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::Mode(std::string para){
     return std::to_string(_ptr_robot->Mode(std::stoi(para)));
@@ -708,7 +763,7 @@ std::string robot_command_thread::Mode(std::string para){
  * @brief 设置速度
  * @param [in] para-速度值，单位为百分比
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetSpeed(std::string para){
     return std::to_string(_ptr_robot->SetSpeed(std::stoi(para)));
@@ -718,7 +773,7 @@ std::string robot_command_thread::SetSpeed(std::string para){
  * @brief 设置工具坐标系标定值
  * @param [in] para-按照顺序依次包含id,x,y,z,rx,ry,rz
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetToolCoord(std::string para){
     //int id, DescPose *coord, int type, int install
@@ -773,7 +828,7 @@ std::string robot_command_thread::ComputeTcp4(std::string para){
  * @brief 设置工具坐标系标定值列表
  * @param [in] para-按照顺序依次包含id,x,y,z,rx,ry,rz
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetToolList(std::string para){
     //int id, DescPose *coord, int type, int install
@@ -784,7 +839,7 @@ std::string robot_command_thread::SetToolList(std::string para){
 
     std::list<std::string> list;
     _splitString2List(para,list);
-    
+
     int id = std::stoi(list.front().c_str());list.pop_front();
     DescPose trans;
     _fillDescPose(list,trans);
@@ -799,7 +854,7 @@ std::string robot_command_thread::SetToolList(std::string para){
  * @brief 设置外部工具坐标系标定值
  * @param [in] para-按照顺序依次包含id,x,y,z,rx,ry,rz
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetExToolCoord(std::string para){
     //int id, DescPose *etcp, DescPose *etool
@@ -809,7 +864,7 @@ std::string robot_command_thread::SetExToolCoord(std::string para){
     _splitString2List(para,list);
 
     int id = std::stoi(list.front().c_str());list.pop_front();
-    
+
     _fillDescPose(list,etcp);
     _fillDescPose(list,etool);
 
@@ -821,7 +876,7 @@ std::string robot_command_thread::SetExToolCoord(std::string para){
  * @brief 设置外部工具坐标系列表
  * @param [in] para-按照顺序依次包含id,x,y,z,rx,ry,rz
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetExToolList(std::string para){
     //int id, DescPose *etcp, DescPose *etool
@@ -831,7 +886,7 @@ std::string robot_command_thread::SetExToolList(std::string para){
     _splitString2List(para,list);
 
     int id = std::stoi(list.front().c_str());list.pop_front();
-    
+
     _fillDescPose(list,etcp);
     _fillDescPose(list,etool);
 
@@ -842,7 +897,7 @@ std::string robot_command_thread::SetExToolList(std::string para){
  * @brief 设置工件坐标系标定值
  * @param [in] para-按照顺序依次包含id,x,y,z,rx,ry,rz
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetWObjCoord(std::string para){
     //int id, DescPose *coord
@@ -851,7 +906,7 @@ std::string robot_command_thread::SetWObjCoord(std::string para){
     _splitString2List(para,list);
 
     int id = std::stoi(list.front().c_str());list.pop_front();
-    
+
     _fillDescPose(list,coord);
     int ref_frame = 0;
     return std::to_string(_ptr_robot->SetWObjCoord(id,&coord,ref_frame));
@@ -861,7 +916,7 @@ std::string robot_command_thread::SetWObjCoord(std::string para){
  * @brief 设置工件坐标系列表
  * @param [in] para-按照顺序依次包含id,x,y,z,rx,ry,rz
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetWObjList(std::string para){
     //int id, DescPose *coord
@@ -870,7 +925,7 @@ std::string robot_command_thread::SetWObjList(std::string para){
     _splitString2List(para,list);
 
     int id = std::stoi(list.front().c_str());list.pop_front();
-    
+
     _fillDescPose(list,coord);
     int ref_frame = 0;
     return std::to_string(_ptr_robot->SetWObjList(id,&coord,ref_frame));
@@ -880,7 +935,7 @@ std::string robot_command_thread::SetWObjList(std::string para){
  * @brief 设置末端负载重量
  * @param [in] para-loadNum,weight
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetLoadWeight(std::string para){
     //int loadNum,float weight
@@ -897,7 +952,7 @@ std::string robot_command_thread::SetLoadWeight(std::string para){
  * @brief 设置末端负载质心偏移
  * @param [in] para-x,y,z,rx,ry,rz
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetLoadCoord(std::string para){
     //DescTran *coord
@@ -913,7 +968,7 @@ std::string robot_command_thread::SetLoadCoord(std::string para){
  * @brief 设置机械臂安装方式
  * @param [in] para-安装方式
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetRobotInstallPos(std::string para){
     //uint8_t install
@@ -924,7 +979,7 @@ std::string robot_command_thread::SetRobotInstallPos(std::string para){
  * @brief 设置机械臂安装角度
  * @param [in] para-顺序为yangle,zangle
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetRobotInstallAngle(std::string para){
     //double yangle, double zangle
@@ -939,7 +994,7 @@ std::string robot_command_thread::SetRobotInstallAngle(std::string para){
  * @brief 设置防碰撞策略
  * @param [in] para-顺序为mode,level[6],config
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetAnticollision(std::string para){
     //int mode, float level[6], int config
@@ -950,7 +1005,7 @@ std::string robot_command_thread::SetAnticollision(std::string para){
 
     std::list<std::string> list;
     _splitString2List(para,list);
-    
+
     int modei = std::stoi(list.front());list.pop_front();
     float level[6];
     for(int i=0;i<6;i++){
@@ -965,7 +1020,7 @@ std::string robot_command_thread::SetAnticollision(std::string para){
  * @brief 设置防碰撞等级
  * @param [in] para-strategy,safedisntance,safevel
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetCollisionStrategy(std::string para){
     //int strategy int safetime,int safedistance,int safevel,int* safemargin
@@ -983,7 +1038,7 @@ std::string robot_command_thread::SetCollisionStrategy(std::string para){
  * @brief 设置关节正限位的值
  * @param [in] para-limit[6]每个关节限位角度
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetLimitPositive(std::string para){
     //float limit[6]
@@ -1001,7 +1056,7 @@ std::string robot_command_thread::SetLimitPositive(std::string para){
  * @brief 设置关节负限位的值
  * @param [in] para-limit[6]每个关节限位角度
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetLimitNegtive(std::string para){
     //float limit[6]
@@ -1017,7 +1072,7 @@ std::string robot_command_thread::SetLimitNegtive(std::string para){
 /**
  * @brief 尝试清除错误
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ResetAllError(std::string para){
     //empty para
@@ -1029,7 +1084,7 @@ std::string robot_command_thread::ResetAllError(std::string para){
  * @brief 摩擦力补偿开关
  * @param [in] para- 1-打开，0-关闭
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::FrictionCompensationOnOff(std::string para){
     //uint8_t state
@@ -1041,7 +1096,7 @@ std::string robot_command_thread::FrictionCompensationOnOff(std::string para){
  * @brief 设置关节摩擦力等级
  * @param [in] para- coeff[6]
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetFrictionValue_level(std::string para){
     //float coeff[6]
@@ -1060,7 +1115,7 @@ std::string robot_command_thread::SetFrictionValue_level(std::string para){
  * @brief 侧装状态设置关节摩擦力
  * @param [in] para- coeff[6]
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetFrictionValue_wall(std::string para){
     //float coeff[6]
@@ -1078,7 +1133,7 @@ std::string robot_command_thread::SetFrictionValue_wall(std::string para){
  * @brief 倒装状态设置关节摩擦力
  * @param [in] para- coeff[6]
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetFrictionValue_ceiling(std::string para){
     //float coeff[6]
@@ -1096,7 +1151,7 @@ std::string robot_command_thread::SetFrictionValue_ceiling(std::string para){
  * @brief 自由安装状态设置关节摩擦力
  * @param [in] para- coeff[6]
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetFrictionValue_freedom(std::string para){
     //float coeff[6]
@@ -1114,7 +1169,7 @@ std::string robot_command_thread::SetFrictionValue_freedom(std::string para){
  * @brief 激活夹爪
  * @param [in] para-顺序依次为index,act
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ActGripper(std::string para){
     //int index, uint8_t act
@@ -1130,7 +1185,7 @@ std::string robot_command_thread::ActGripper(std::string para){
  * @param [in] para-顺序依次为index,pos
  * @attention 默认使用的线性导轨夹爪，如果需要改旋转夹爪需要修改后面的4个参数
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::MoveGripper(std::string para){
     //int index, int pos, int vel, int force, int max_time, uint8_t block
@@ -1139,11 +1194,11 @@ std::string robot_command_thread::MoveGripper(std::string para){
     force = this->get_parameter("gripper_force").value_to_string();
     mtime  = this->get_parameter("gripper_maxtime").value_to_string();//数据读取异常
     block = this->get_parameter("gripper_block").value_to_string();
-    para = para + "," + vel + "," + force + "," + mtime + "," + block; 
-    
+    para = para + "," + vel + "," + force + "," + mtime + "," + block;
+
     std::list<std::string> list;
     _splitString2List(para,list);
-    
+
     int index = std::stoi(list.front());list.pop_front();
     int pos = std::stoi(list.front());list.pop_front();
     int veli = std::stoi(list.front());list.pop_front();
@@ -1152,12 +1207,12 @@ std::string robot_command_thread::MoveGripper(std::string para){
     uint8_t blocki = 1;
     return std::to_string(_ptr_robot->MoveGripper(index,pos,veli,forcei,max_timei,blocki,0,0,0,0));
 }
-    
+
 /**
  * @brief 设置数字IO输出
  * @param [in] para-顺序依次为id,status
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetDO(std::string para){
     //int id, uint8_t status, uint8_t smooth, uint8_t block
@@ -1173,7 +1228,7 @@ std::string robot_command_thread::SetDO(std::string para){
     uint8_t status = std::stoi(list.front());list.pop_front();
     uint8_t smoothi = std::stoi(list.front());list.pop_front();
     uint8_t blocki = std::stoi(list.front());
-    
+
     return std::to_string(_ptr_robot->SetDO(id,status,smoothi,blocki));
 }
 
@@ -1181,7 +1236,7 @@ std::string robot_command_thread::SetDO(std::string para){
  * @brief 设置工具数字IO输出
  * @param [in] para-顺序依次为id,status
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetToolDO(std::string para){
     //int id, uint8_t status, uint8_t smooth, uint8_t block
@@ -1197,7 +1252,7 @@ std::string robot_command_thread::SetToolDO(std::string para){
     uint8_t status = std::stoi(list.front());list.pop_front();
     uint8_t smoothi = std::stoi(list.front());list.pop_front();
     uint8_t blocki = std::stoi(list.front());
-    
+
     return std::to_string(_ptr_robot->SetToolDO(id,status,smoothi,blocki));
 }
 
@@ -1205,7 +1260,7 @@ std::string robot_command_thread::SetToolDO(std::string para){
  * @brief 设置模拟IO输出
  * @param [in] para-顺序依次为id,value
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetAO(std::string para){
     //int id, float value, uint8_t block
@@ -1227,7 +1282,7 @@ std::string robot_command_thread::SetAO(std::string para){
  * @brief 设置工具模拟IO输出
  * @param [in] para-顺序依次为id,value
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetToolAO(std::string para){
     //int id, float value, uint8_t block
@@ -1249,7 +1304,7 @@ std::string robot_command_thread::SetToolAO(std::string para){
  * @brief 设置辅助数字IO输出
  * @param [in] para-顺序依次为number,open
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetAuxDO(std::string para){
     //int DOnumber,bool open, bool smooth, bool block
@@ -1272,7 +1327,7 @@ std::string robot_command_thread::SetAuxDO(std::string para){
  * @brief 设置辅助模拟IO输出
  * @param [in] para-顺序依次为number,percentage
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetAuxAO(std::string para){
     //int number int percentage
@@ -1282,7 +1337,7 @@ std::string robot_command_thread::SetAuxAO(std::string para){
 
     std::list<std::string> list;
     _splitString2List(para,list);
-    
+
     int number = std::stoi(list.front());list.pop_front();
     double value = std::stod(list.front())/100*4095;list.pop_front();
     uint8_t blocki = std::stoi(list.front());
@@ -1294,13 +1349,13 @@ std::string robot_command_thread::SetAuxAO(std::string para){
  * @brief 外部轴使能
  * @param [in] para-顺序依次为number,switch
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ExtAxisServoOn(std::string para){
     //int number, int switch
     std::list<std::string> list;
     _splitString2List(para,list);
-    
+
     int number = std::stoi(list.front());list.pop_front();
     uint8_t sw = std::stoi(list.front());
     return std::to_string(_ptr_robot->ExtAxisServoOn(number,sw));
@@ -1310,13 +1365,13 @@ std::string robot_command_thread::ExtAxisServoOn(std::string para){
  * @brief 外部轴点动开始
  * @param [in] para-顺序依次为number,direction,speed,acc,max_distance
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ExtAxisStartJog(std::string para){
     //6, int number, int direction, int speed, int acc_speed, double max_distance
     std::list<std::string> list;
     _splitString2List(para,list);
-    
+
     int number = std::stoi(list.front());list.pop_front();
     int direction = std::stoi(list.front());list.pop_front();
     int speed = std::stoi(list.front());list.pop_front();
@@ -1330,7 +1385,7 @@ std::string robot_command_thread::ExtAxisStartJog(std::string para){
  * @brief 外部轴回零
  * @param [in] para-顺序依次为number,zero_mode,search_speed,latch_speed
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ExtAxisSetHoming(std::string para){
     //int number, int zero_mode, int search_speed, int latch_speed
@@ -1348,7 +1403,7 @@ std::string robot_command_thread::ExtAxisSetHoming(std::string para){
  * @brief 外部轴停止点动
  * @param [in] para- index
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::StopExtAxisJog(std::string para){
     //int indexid
@@ -1358,7 +1413,7 @@ std::string robot_command_thread::StopExtAxisJog(std::string para){
 /**
  * @brief 获取UDP扩展轴坐标系
  * @return 指令执行是否成功及坐标系数值
- * @retval flag,x,y,z,rx,ry,rz 
+ * @retval flag,x,y,z,rx,ry,rz
  */
 std::string robot_command_thread::ExtAxisGetCoord(std::string para){
     DescPose cartpos;
@@ -1375,7 +1430,7 @@ std::string robot_command_thread::ExtAxisGetCoord(std::string para){
 /**
  * @brief UDP扩展轴移动
  * @return 指令执行是否成功及坐标系数值
- * @retval flag,x,y,z,rx,ry,rz 
+ * @retval flag,x,y,z,rx,ry,rz
  */
 std::string robot_command_thread::ExtAxisMove(std::string para){
     ExaxisPos tarpos;
@@ -1392,7 +1447,7 @@ std::string robot_command_thread::ExtAxisMove(std::string para){
 /**
  * @brief UDP扩展轴移动
  * @return 指令执行是否成功及坐标系数值
- * @retval flag,x,y,z,rx,ry,rz 
+ * @retval flag,x,y,z,rx,ry,rz
  */
 std::string robot_command_thread::ExtAxisSyncMoveJ(std::string para){
     std::list<std::string> list;
@@ -1524,13 +1579,13 @@ std::string robot_command_thread::ExtDevLoadUDPDriver(std::string para){
  * @brief 机械臂关节点动
  * @param [in] para- 参数顺序依次为ref,nb,dir,vel,acc,max_dis
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::StartJOG(std::string para){
     //uint8_t ref, uint8_t nb, uint8_t dir, float vel, float acc, float max_dis
     std::list<std::string> list;
     _splitString2List(para,list);
-    
+
     uint8_t ref = std::stoi(list.front());list.pop_front();
     uint8_t nb = std::stoi(list.front());list.pop_front();
     uint8_t dir = std::stoi(list.front());list.pop_front();
@@ -1545,7 +1600,7 @@ std::string robot_command_thread::StartJOG(std::string para){
  * @brief 机械臂减速停止点动
  * @param [in] para- ref
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::StopJOG(std::string para){
     //uint8_t ref
@@ -1555,7 +1610,7 @@ std::string robot_command_thread::StopJOG(std::string para){
 /**
  * @brief 机械臂立即停止点动
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ImmStopJOG(std::string para){
     //empty para
@@ -1567,7 +1622,7 @@ std::string robot_command_thread::ImmStopJOG(std::string para){
  * @brief 机械臂关节空间运动
  * @param [in] para - 顺序依次为JNT点位/CART点位,speed,tool,user
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::MoveJ(std::string para){
     //JointPos *joint_pos, DescPose *desc_pos, int tool, int user, float vel, float acc, float ovl, ExaxisPos *epos, float blendT, uint8_t offset_flag, DescPose *offset_pos
@@ -1660,7 +1715,7 @@ std::string robot_command_thread::MoveJ(std::string para){
  * @brief 机械臂笛卡尔空间直线运动
  * @param [in] para - 顺序依次为JNT点位/CART点位,speed,tool,user
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::MoveL(std::string para){
     //JointPos *joint_pos, DescPose *desc_pos, int tool, int user, float vel, float acc, float ovl, float blendR, ExaxisPos *epos, uint8_t search, uint8_t offset_flag, DescPose *offset_pos
@@ -1750,7 +1805,7 @@ std::string robot_command_thread::MoveL(std::string para){
  * @brief 机械臂笛卡尔空间圆弧运动
  * @param [in] para - 顺序依次为两个JNT点位/CART点位,speed,tool,user
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::MoveC(std::string para){
     /*JointPos *joint_pos_p, DescPose *desc_pos_p, int ptool, int puser, float pvel, float pacc, ExaxisPos *epos_p, uint8_t poffset_flag, DescPose *offset_pos_p,
@@ -1786,7 +1841,7 @@ std::string robot_command_thread::MoveC(std::string para){
     DescPose cartpos,cartpos2;
 
     if(std::regex_match(head_str,num_match,std::regex("(JNT)([0-9]*)")) && \
-        std::regex_match(second_str,num_match2,std::regex("(JNT)([0-9]*)"))){   
+        std::regex_match(second_str,num_match2,std::regex("(JNT)([0-9]*)"))){
         int index = atol(num_match[2].str().c_str());
         int index2 = atol(num_match2[2].str().c_str());
         if(index > _cmd_jnt_pos_list.size() || index2 > _cmd_jnt_pos_list.size()){
@@ -1800,7 +1855,7 @@ std::string robot_command_thread::MoveC(std::string para){
             _ptr_robot->GetForwardKin(&tmp_jnt_pos2,&cartpos2) != 0){
             RCLCPP_INFO(rclcpp::get_logger(LOGGER_NAME),msgout[msg_id(fwd_kin_error)]);
             return "-1";
-        } 
+        }
     }else if(std::regex_match(head_str,num_match,std::regex("(CART)([0-9]*)")) && \
               std::regex_match(second_str,num_match2,std::regex("(CART)([0-9]*)"))){
         int index = atol(num_match[2].str().c_str());
@@ -1864,13 +1919,13 @@ std::string robot_command_thread::MoveC(std::string para){
 
     return std::to_string(_ptr_robot->MoveC(&tmp_jnt_pos,&cartpos,tool,user,speed,acc,\
         &extpos1,offset_flag,&offsetpos,&tmp_jnt_pos2,&cartpos2,tool,user,speed,acc,&extpos2,\
-        offset_flag,&offsetpos,ovl,blendR));      
+        offset_flag,&offsetpos,ovl,blendR));
 }
 
 std::string robot_command_thread::Circle(std::string para){
-    /*JointPos *joint_pos_p, DescPose *desc_pos_p, int ptool, 
-    int puser, float pvel, float pacc, ExaxisPos *epos_p, JointPos *joint_pos_t, 
-    DescPose *desc_pos_t, int ttool, int tuser, float tvel, float tacc, 
+    /*JointPos *joint_pos_p, DescPose *desc_pos_p, int ptool,
+    int puser, float pvel, float pacc, ExaxisPos *epos_p, JointPos *joint_pos_t,
+    DescPose *desc_pos_t, int ttool, int tuser, float tvel, float tacc,
     ExaxisPos *epos_t, float ovl, uint8_t offset_flag, DescPose *offset_pos*/
     return "-1";
 }
@@ -1879,7 +1934,7 @@ std::string robot_command_thread::Circle(std::string para){
  * @brief 机械臂关节伺服指令，该指令对于实时性要求较高
  * @param [in] jntpos-六个关节的位置指令，单位为度，eaxispos-4个外部轴位置指令，单位为度，deltaT-指令时间间隔，范围0.001~0.0016
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ServoJ(std::string para){
     std::list<std::string> datalist;
@@ -1903,7 +1958,7 @@ std::string robot_command_thread::ServoJ(std::string para){
 /**
  * @brief 机械臂关节空间样条运动开始
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SplineStart(std::string para){
     //empty para
@@ -1915,10 +1970,10 @@ std::string robot_command_thread::SplineStart(std::string para){
  * @brief 机械臂关节空间样条运动
  * @param [in] para-顺序依次是JNT点位，tool,user,vel
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SplinePTP(std::string para){
-    /*JointPos *joint_pos, DescPose *desc_pos, int tool, 
+    /*JointPos *joint_pos, DescPose *desc_pos, int tool,
     int user, float vel, float acc, float ovl*/
     //默认进来的都是JNT数据
     int speed,tool,user;
@@ -1932,7 +1987,7 @@ std::string robot_command_thread::SplinePTP(std::string para){
 
     std::smatch num_match;
     std::string head_str = iter_data->str();
-    if(std::regex_match(head_str,num_match,std::regex("(JNT)([0-9]*)"))){ 
+    if(std::regex_match(head_str,num_match,std::regex("(JNT)([0-9]*)"))){
         int index = atol(num_match[2].str().c_str());
         if(index > _cmd_jnt_pos_list.size()){
             RCLCPP_INFO(rclcpp::get_logger(LOGGER_NAME),msgout[msg_id(out_container_range)]);
@@ -1972,7 +2027,7 @@ std::string robot_command_thread::SplinePTP(std::string para){
 /**
  * @brief 机械臂关节空间样条运动结束
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SplineEnd(std::string para){
     //empty para
@@ -1985,7 +2040,7 @@ std::string robot_command_thread::SplineEnd(std::string para){
  * @brief 机械臂笛卡尔空间样条运动开始
  * @param [in] para-type 0-圆弧过渡，1-给定点位为路径点
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::NewSplineStart(std::string para){
     //uint8_t ctlPoint
@@ -1996,10 +2051,10 @@ std::string robot_command_thread::NewSplineStart(std::string para){
  * @brief 机械臂笛卡尔空间样条运动
  * @param [in] para-顺序依次是CART点位，speed,tool,user,lastflag
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::NewSplinePoint(std::string para){
-    /*JointPos *joint_pos, DescPose *desc_pos, int tool, int user, float vel, 
+    /*JointPos *joint_pos, DescPose *desc_pos, int tool, int user, float vel,
       float acc, float ovl float blendR uint8_t lastFlag*/
     //输入参数:pos,speed,lastflag
 
@@ -2047,7 +2102,7 @@ std::string robot_command_thread::NewSplinePoint(std::string para){
 
             lastflag = std::stoi(iter_data->str());
         }
-        
+
         return std::to_string(_ptr_robot->NewSplinePoint(&jntpos,&cartpos,tool,user,speed,\
             acc,ovl,blendR,lastflag));
     }else{
@@ -2059,7 +2114,7 @@ std::string robot_command_thread::NewSplinePoint(std::string para){
 /**
  * @brief 机械臂笛卡尔空间样条运动结束
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::NewSplineEnd(std::string para){
     //empty para
@@ -2070,7 +2125,7 @@ std::string robot_command_thread::NewSplineEnd(std::string para){
 /**
  * @brief 机械臂停止运动
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::StopMotion(std::string para){
     //empty para
@@ -2082,7 +2137,7 @@ std::string robot_command_thread::StopMotion(std::string para){
  * @brief 点位偏移使能
  * @param [in] para-顺序依次是flag, offset_pos
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::PointsOffsetEnable(std::string para){
     //int flag, DescPose *offset_pos
@@ -2092,14 +2147,14 @@ std::string robot_command_thread::PointsOffsetEnable(std::string para){
     int flag = std::stoi(list.front());list.pop_front();
     DescPose cartpos;
     _fillDescPose(list,cartpos);
-    
+
     return std::to_string(_ptr_robot->PointsOffsetEnable(flag,&cartpos));
 }
 
 /**
  * @brief 点位偏移关闭
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::PointsOffsetDisable(std::string para){
     //empty para
@@ -2110,15 +2165,15 @@ std::string robot_command_thread::PointsOffsetDisable(std::string para){
  * @brief 设置扩展轴配置参数
  * @param [in] para-servoid,servocomany,model,softversion,reoslution,ratio
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
-std::string robot_command_thread::AuxServoSetParam(std::string para){ 
+std::string robot_command_thread::AuxServoSetParam(std::string para){
     int servoid,servocomany,model,version,resolution;
     double ratio;
 
     std::list<std::string> list;
     _splitString2List(para,list);
-    
+
     servoid = std::stoi(list.front());list.pop_front();
     servocomany = std::stoi(list.front());list.pop_front();
     model = std::stoi(list.front());list.pop_front();
@@ -2133,12 +2188,12 @@ std::string robot_command_thread::AuxServoSetParam(std::string para){
  * @brief 设置扩展轴使能
  * @param [in] para-servoid, status
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::AuxServoEnable(std::string para){
     std::list<std::string> list;
     _splitString2List(para,list);
-    
+
     int servoid;
     uint8_t status;
     servoid = std::stoi(list.front());list.pop_front();
@@ -2152,7 +2207,7 @@ std::string robot_command_thread::AuxServoEnable(std::string para){
  * @brief 设置扩展轴控制模式
  * @param [in] para-servoid, mode
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::AuxServoSetControlMode(std::string para){
     std::list<std::string> list;
@@ -2161,7 +2216,7 @@ std::string robot_command_thread::AuxServoSetControlMode(std::string para){
     int servoid,mode;
     servoid = std::stoi(list.front());list.pop_front();
     mode = std::stoi(list.front());
-    
+
     return std::to_string(_ptr_robot->AuxServoSetControlMode(servoid,mode));
 }
 
@@ -2169,7 +2224,7 @@ std::string robot_command_thread::AuxServoSetControlMode(std::string para){
  * @brief 设置扩展轴目标位置
  * @param [in] para-servoid,pos,speed
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::AuxServoSetTargetPos(std::string para){
     std::list<std::string> list;
@@ -2180,7 +2235,7 @@ std::string robot_command_thread::AuxServoSetTargetPos(std::string para){
     servoid = std::stoi(list.front());list.pop_front();
     pos = std::stod(list.front());list.pop_front();
     speed = std::stod(list.front());
-    
+
     return std::to_string(_ptr_robot->AuxServoSetTargetPos(servoid,pos,speed));
 }
 
@@ -2188,7 +2243,7 @@ std::string robot_command_thread::AuxServoSetTargetPos(std::string para){
  * @brief 设置扩展轴目标速度
  * @param [in] para-servoid,speed
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::AuxServoSetTargetSpeed(std::string para){
 
@@ -2207,7 +2262,7 @@ std::string robot_command_thread::AuxServoSetTargetSpeed(std::string para){
  * @brief 设置扩展轴目标扭矩
  * @param [in] para-servoid,torque
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::AuxServoSetTargetTorque(std::string para){
     std::list<std::string> list;
@@ -2225,7 +2280,7 @@ std::string robot_command_thread::AuxServoSetTargetTorque(std::string para){
  * @brief 扩展轴归零
  * @param [in] para-servoid,mode,searchvel,latchvel
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::AuxServoHoming(std::string para){
     std::list<std::string> list;
@@ -2245,7 +2300,7 @@ std::string robot_command_thread::AuxServoHoming(std::string para){
  * @brief 扩展轴清除错误
  * @param [in] para-servoid
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::AuxServoClearError(std::string para){
     return std::to_string(_ptr_robot->AuxServoClearError(std::stoi(para)));
@@ -2255,7 +2310,7 @@ std::string robot_command_thread::AuxServoClearError(std::string para){
  * @brief 设置扩展轴ID
  * @param [in] para-servoid
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::AuxServoSetStatusID(std::string para){
     return std::to_string(_ptr_robot->AuxServosetStatusID(std::stoi(para)));
@@ -2268,7 +2323,7 @@ std::string robot_command_thread::AuxServoSetStatusID(std::string para){
  * @brief 加载脚本
  * @param [in] para-program_name[64]
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ScriptLoad(std::string para){
     //program_name[64]
@@ -2284,7 +2339,7 @@ std::string robot_command_thread::ScriptLoad(std::string para){
 /**
  * @brief 开始执行脚本
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ScriptStart(std::string para){
     return std::to_string(_ptr_robot->ProgramRun());
@@ -2293,7 +2348,7 @@ std::string robot_command_thread::ScriptStart(std::string para){
 /**
  * @brief 停止脚本
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ScriptStop(std::string para){
     //empty
@@ -2303,7 +2358,7 @@ std::string robot_command_thread::ScriptStop(std::string para){
 /**
  * @brief 暂停脚本执行
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ScriptPause(std::string para){
     //empty
@@ -2313,7 +2368,7 @@ std::string robot_command_thread::ScriptPause(std::string para){
 /**
  * @brief 继续执行脚本
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ScriptResume(std::string para){
     //empty
@@ -2366,7 +2421,7 @@ std::string robot_command_thread::GetControllerVersion(std::string para){
 /**
  * @brief 获取工具标定值
  * @return TCP标定值
- * @retval res,x,y,z,rx,ry,rz 
+ * @retval res,x,y,z,rx,ry,rz
  */
 std::string robot_command_thread::GetTCPOffset(std::string para){
     uint8_t index = std::stoi(para);
@@ -2451,7 +2506,7 @@ std::string robot_command_thread::GetInverseKin(std::string para){
  * @brief 可移动设备使能
  * @param [in] para-使能状态，0-去使能 1-使能
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::TractorEnable(std::string para){
     //bool enable
@@ -2462,7 +2517,7 @@ std::string robot_command_thread::TractorEnable(std::string para){
 /**
  * @brief 可移动设备回零
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::TractorHoming(std::string para){
     //empty para
@@ -2473,13 +2528,13 @@ std::string robot_command_thread::TractorHoming(std::string para){
  * @brief 可移动设备直线运动
  * @param [in] para-distance,vel
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::TractorMoveL(std::string para){
     //double distance, double vel
     std::list<std::string> list;
     _splitString2List(para,list);
-    
+
     double distance = std::stod(list.front());list.pop_front();
     double vel = std::stod(list.front());
     return std::to_string(_ptr_robot->TractorMoveL(distance,vel));
@@ -2489,13 +2544,13 @@ std::string robot_command_thread::TractorMoveL(std::string para){
  * @brief 可移动设备圆弧运动
  * @param [in] para-ratio,angle,vel
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::TractorMoveC(std::string para){
     //double ratio, double angle, double vel
     std::list<std::string> list;
     _splitString2List(para,list);
-    
+
     double ratio = std::stod(list.front());list.pop_front();
     double angle = std::stod(list.front());list.pop_front();
     double vel = std::stod(list.front());
@@ -2505,7 +2560,7 @@ std::string robot_command_thread::TractorMoveC(std::string para){
 /**
  * @brief 可移动设备运动停止
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::TractorStop(std::string para){
     //empty para
@@ -2517,7 +2572,7 @@ std::string robot_command_thread::TractorStop(std::string para){
  * @brief 上传轨迹J文件
  * @param [in] para-filepath
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::TrajectoryJUpLoad(std::string para){
     //string filepath
@@ -2528,7 +2583,7 @@ std::string robot_command_thread::TrajectoryJUpLoad(std::string para){
  * @brief 删除轨迹J文件
  * @param [in] para-filename
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::TrajectoryJDelete(std::string para){
     //const string filename
@@ -2539,7 +2594,7 @@ std::string robot_command_thread::TrajectoryJDelete(std::string para){
  * @brief 加载轨迹J文件
  * @param [in] para-name[30],ovl
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::LoadTrajectoryJ(std::string para){
     //char name[30], float ovl
@@ -2554,7 +2609,7 @@ std::string robot_command_thread::LoadTrajectoryJ(std::string para){
 /**
  * @brief 运行轨迹J文件
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::MoveTrajectoryJ(std::string para){
     //empty para
@@ -2564,7 +2619,7 @@ std::string robot_command_thread::MoveTrajectoryJ(std::string para){
 /**
  * @brief 获取轨迹J文件第一个点的初始位姿
  * @param [in] para-name[30]
- * @return 初始点位姿 
+ * @return 初始点位姿
  * @retval x,y,z,rx,ry,rz
  */
 std::string robot_command_thread::GetTrajectoryStartPose(std::string para){
@@ -2580,7 +2635,7 @@ std::string robot_command_thread::GetTrajectoryStartPose(std::string para){
                 std::to_string(pos.tran.y) + "," +\
                 std::to_string(pos.tran.z) + "," +\
                 std::to_string(pos.rpy.rx) + "," +\
-                std::to_string(pos.rpy.ry) + "," +\   
+                std::to_string(pos.rpy.ry) + "," +\
                 std::to_string(pos.rpy.rz);
     }else{
         return std::string("0,0,0,0,0,0");
@@ -2606,7 +2661,7 @@ std::string robot_command_thread::GetTrajectoryPointNum(std::string para){
  * @brief 设置轨迹J运行速度
  * @param [in] para-vel
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetTrajectoryJSpeed(std::string para){
     std::list<std::string> list;
@@ -2623,7 +2678,7 @@ std::string robot_command_thread::SetTrajectoryJSpeed(std::string para){
  * @brief 下载LUA脚本
  * @param [in] para-filename,filepath
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::LuaDownLoad(std::string para){
     //string filename,string filepath
@@ -2639,7 +2694,7 @@ std::string robot_command_thread::LuaDownLoad(std::string para){
  * @brief 上传LUA脚本
  * @param [in] para-filepath
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::LuaUpload(std::string para){
     //string filepath
@@ -2655,7 +2710,7 @@ std::string robot_command_thread::LuaUpload(std::string para){
  * @brief 删除LUA脚本
  * @param [in] para-filename
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::LuaDelete(std::string para){
     //string filename
@@ -2730,7 +2785,7 @@ std::string robot_command_thread::ComputeWObjCoordWithPoints(std::string para){
 std::string robot_command_thread::WeldingSetCurrent(std::string para){
     std::list<std::string> list;
     _splitString2List(para,list);
-    
+
     int iotype = std::stoi(list.front().c_str());list.pop_front();
     double current = std::stof(list.front().c_str());list.pop_front();
     int AOIndex = std::stoi(list.front().c_str());list.pop_front();
@@ -2757,7 +2812,7 @@ std::string robot_command_thread::WeldingSetVoltage(std::string para){
  * @param [in] checkEnable 是否使能检测；0-不使能；1-使能
  * @param [in] arcInterruptTimeLength 电弧中断确认时长(ms)
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::WeldingSetCheckArcInterruptionParam(std::string para){
     std::list<std::string> list;
@@ -2818,7 +2873,7 @@ std::string robot_command_thread::WeldingGetReWeldAfterBreakOffParam(std::string
 /**
  * @brief 开始机器人焊接电弧意外中断
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::WeldingStartReWeldAfterBreakOff(std::string para){
     return std::to_string(_ptr_robot->WeldingStartReWeldAfterBreakOff());
@@ -2827,7 +2882,7 @@ std::string robot_command_thread::WeldingStartReWeldAfterBreakOff(std::string pa
 /**
  * @brief 停止机器人焊接电弧意外中断
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::WeldingAbortWeldAfterBreakOff(std::string para){
     return std::to_string(_ptr_robot->WeldingAbortWeldAfterBreakOff());
@@ -2892,7 +2947,7 @@ std::string robot_command_thread::PhotoelectricSensorTCPCalibration(std::string 
 std::string robot_command_thread::SetDIConfig(std::string para){
     std::list<std::string> list;
     _splitString2List(para,list);
-        
+
     int config[8];
     for(int i = 0; i < 8; i++)
     {
@@ -2916,7 +2971,7 @@ std::string robot_command_thread::SetDIConfig(std::string para){
 * @return 错误码
 */
 std::string robot_command_thread::GetDIConfig(std::string para){
-        
+
     int config[8];
 
     int res = _ptr_robot->GetDIConfig(config);
@@ -2972,7 +3027,7 @@ std::string robot_command_thread::SetDOConfig(std::string para){
 * @return 错误码
 */
 std::string robot_command_thread::GetDOConfig(std::string para){
-        
+
     int config[8];
 
     int res = _ptr_robot->GetDOConfig(config);
@@ -2996,7 +3051,7 @@ std::string robot_command_thread::GetDOConfig(std::string para){
 std::string robot_command_thread::SetToolDIConfig(std::string para){
     std::list<std::string> list;
     _splitString2List(para,list);
-        
+
     int config[2];
     for(int i = 0; i < 2; i++)
     {
@@ -3019,7 +3074,7 @@ std::string robot_command_thread::SetToolDIConfig(std::string para){
 * @return 错误码
 */
 std::string robot_command_thread::GetToolDIConfig(std::string para){
-        
+
     int config[2];
 
     int res = _ptr_robot->GetToolDIConfig(config);
@@ -3036,7 +3091,7 @@ std::string robot_command_thread::GetToolDIConfig(std::string para){
 std::string robot_command_thread::SetDIConfigLevel(std::string para){
     std::list<std::string> list;
     _splitString2List(para,list);
-        
+
     int config[8];
     for(int i = 0; i < 8; i++)
     {
@@ -3071,7 +3126,7 @@ std::string robot_command_thread::GetDIConfigLevel(std::string para){
 std::string robot_command_thread::SetDOConfigLevel(std::string para){
     std::list<std::string> list;
     _splitString2List(para,list);
-        
+
     int config[8];
     for(int i = 0; i < 8; i++)
     {
@@ -3090,7 +3145,7 @@ std::string robot_command_thread::SetDOConfigLevel(std::string para){
 std::string robot_command_thread::GetDOConfigLevel(std::string para){
     std::list<std::string> list;
     _splitString2List(para,list);
-        
+
     int config[8];
 
     int res = _ptr_robot->GetDOConfigLevel(config);
@@ -3109,7 +3164,7 @@ std::string robot_command_thread::GetDOConfigLevel(std::string para){
 std::string robot_command_thread::SetToolDIConfigLevel(std::string para){
     std::list<std::string> list;
     _splitString2List(para,list);
-        
+
     int config[2];
     for(int i = 0; i < 2; i++)
     {
@@ -3125,7 +3180,7 @@ std::string robot_command_thread::SetToolDIConfigLevel(std::string para){
  * @param [out] config CI0-CI1端口有效状态；0-高电平有效；1-低电平有效
  * @return 错误码
  */
-std::string robot_command_thread::GetToolDIConfigLevel(std::string para){        
+std::string robot_command_thread::GetToolDIConfigLevel(std::string para){
     int config[2];
 
     int res = _ptr_robot->GetToolDIConfigLevel(config);
@@ -3141,7 +3196,7 @@ std::string robot_command_thread::GetToolDIConfigLevel(std::string para){
 std::string robot_command_thread::SetStandardDILevel(std::string para){
     std::list<std::string> list;
     _splitString2List(para,list);
-        
+
     int config[8];
     for(int i = 0; i < 8; i++)
     {
@@ -3157,7 +3212,7 @@ std::string robot_command_thread::SetStandardDILevel(std::string para){
  * @param [out] config DI0-DI7端口有效状态；0-高电平有效；1-低电平有效
  * @return 错误码
  */
-std::string robot_command_thread::GetStandardDILevel(std::string para){        
+std::string robot_command_thread::GetStandardDILevel(std::string para){
     int config[8];
 
     int res = _ptr_robot->GetStandardDILevel(config);
@@ -3176,7 +3231,7 @@ std::string robot_command_thread::GetStandardDILevel(std::string para){
 std::string robot_command_thread::SetStandardDOLevel(std::string para){
     std::list<std::string> list;
     _splitString2List(para,list);
-        
+
     int config[8];
     for(int i = 0; i < 8; i++)
     {
@@ -3212,7 +3267,7 @@ std::string robot_command_thread::GetStandardDOLevel(std::string para){
 std::string robot_command_thread::SetExAxisCmdDoneTime(std::string para){
     std::list<std::string> list;
     _splitString2List(para,list);
-        
+
     double time = std::stod(list.front().c_str());list.pop_front();
 
     int res = _ptr_robot->SetExAxisCmdDoneTime(time);
@@ -3251,7 +3306,7 @@ std::string robot_command_thread::OpenLuaDownload(std::string para){
  * @return 错误码
  */
 std::string robot_command_thread::ExtDevGetUDPComParam(std::string para){
-        
+
     std::string ip;
     int port;
     int period;
@@ -3426,7 +3481,7 @@ std::string robot_command_thread::WeldingSetVoltageRelation(std::string para){
  * @param [in] ioType io类型 0-控制器IO； 1-扩展IO
  * @param [in] arcNum 焊机配置文件编号
  * @param [in] timeout 起弧超时时间
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ARCStart(std::string para){
     std::list<std::string> list;
@@ -3445,7 +3500,7 @@ std::string robot_command_thread::ARCStart(std::string para){
  * @param [in] ioType io类型 0-控制器IO； 1-扩展IO
  * @param [in] arcNum 焊机配置文件编号
  * @param [in] timeout 起弧超时时间
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ARCEnd(std::string para){
     std::list<std::string> list;
@@ -3463,7 +3518,7 @@ std::string robot_command_thread::ARCEnd(std::string para){
  * @brief 正向送丝
  * @param [in] ioType io类型  0-控制器IO；1-扩展IO
  * @param [in] wireFeed 送丝控制  0-停止送丝；1-送丝
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetForwardWireFeed(std::string para){
     std::list<std::string> list;
@@ -3480,7 +3535,7 @@ std::string robot_command_thread::SetForwardWireFeed(std::string para){
  * @brief 反向送丝
  * @param [in] ioType io类型  0-控制器IO；1-扩展IO
  * @param [in] wireFeed 送丝控制  0-停止送丝；1-送丝
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetReverseWireFeed(std::string para){
     std::list<std::string> list;
@@ -3503,7 +3558,7 @@ std::string robot_command_thread::ArcWeldTraceAIChannelCurrent(std::string para)
     _splitString2List(para,list);
 
     int channel = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->ArcWeldTraceAIChannelCurrent(channel);
     return std::string(std::to_string(res));
 }
@@ -3518,7 +3573,7 @@ std::string robot_command_thread::ArcWeldTraceAIChannelVoltage(std::string para)
     _splitString2List(para,list);
 
     int channel = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->ArcWeldTraceAIChannelVoltage(channel);
     return std::string(std::to_string(res));
 }
@@ -3539,7 +3594,7 @@ std::string robot_command_thread::ArcWeldTraceCurrentPara(std::string para){
     float AIHigh = std::stod(list.front());list.pop_front();
     float currentLow = std::stod(list.front());list.pop_front();
     float currentHigh = std::stod(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->ArcWeldTraceCurrentPara(AILow, AIHigh, currentLow, currentHigh);
     return std::string(std::to_string(res));
 }
@@ -3560,7 +3615,7 @@ std::string robot_command_thread::ArcWeldTraceVoltagePara(std::string para){
     float AIHigh = std::stod(list.front());list.pop_front();
     float voltageLow = std::stod(list.front());list.pop_front();
     float voltageHigh = std::stod(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->ArcWeldTraceVoltagePara(AILow, AIHigh, voltageLow, voltageHigh);
     return std::string(std::to_string(res));
 }
@@ -3685,7 +3740,7 @@ std::string robot_command_thread::SetWireSearchExtDIONum(std::string para){
 
     int searchDoneDINum = std::stoi(list.front());list.pop_front();
     int searchStartDONum = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->SetWireSearchExtDIONum(searchDoneDINum,searchStartDONum);
     return std::string(std::to_string(res));
 }
@@ -3704,7 +3759,7 @@ std::string robot_command_thread::SetCtrlOpenLUAName(std::string para){
 
     int id = std::stoi(list.front());list.pop_front();
     std::string name = list.front();list.pop_front();
-    
+
     int res = _ptr_robot->SetCtrlOpenLUAName(id,name);
     return std::string(std::to_string(res));
 }
@@ -3721,13 +3776,13 @@ std::string robot_command_thread::OpenLuaUpload(std::string para){
     std::string filePath = list.front();list.pop_front();
 
     int res = _ptr_robot->OpenLuaUpload(filePath);
-    return std::string(std::to_string(res));            
+    return std::string(std::to_string(res));
 }
 
 /**
  * @brief 获取机器人外设协议
  * @param [in] protocol 机器人外设协议号 4096-扩展轴控制卡；4097-ModbusSlave；4098-ModbusMaster
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetExDevProtocol(std::string para){
     std::list<std::string> list;
@@ -3749,7 +3804,7 @@ std::string robot_command_thread::LoadCtrlOpenLUA(std::string para){
     _splitString2List(para,list);
 
     int id = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->LoadCtrlOpenLUA(id);
     return std::string(std::to_string(res));
 }
@@ -3764,7 +3819,7 @@ std::string robot_command_thread::UnloadCtrlOpenLUA(std::string para){
     _splitString2List(para,list);
 
     int id = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->UnloadCtrlOpenLUA(id);
     return std::string(std::to_string(res));
 }
@@ -3810,7 +3865,7 @@ std::string robot_command_thread::AuxServoSetEmergencyStopAcc(std::string para){
  * @param [out] outputVoltageMin 焊接电流-模拟量输出线性关系左侧点模拟量输出电压值(V)
  * @param [out] outputVoltageMax 焊接电流-模拟量输出线性关系右侧点模拟量输出电压值(V)
  * @param [out] AOIndex 焊接电流模拟量输出端口
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::WeldingGetCurrentRelation(std::string para){
     double currentMin;
@@ -3832,7 +3887,7 @@ std::string robot_command_thread::WeldingGetCurrentRelation(std::string para){
  * @param [out] outputVoltageMin 焊接电压-模拟量输出线性关系左侧点模拟量输出电压值(V)
  * @param [out] outputVoltageMax 焊接电压-模拟量输出线性关系右侧点模拟量输出电压值(V)
  * @param [out] AOIndex 焊接电压模拟量输出端口
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::WeldingGetVoltageRelation(std::string para){
     double weldVoltageMin;
@@ -3850,7 +3905,7 @@ std::string robot_command_thread::WeldingGetVoltageRelation(std::string para){
 /**
  * @brief 设置机器人外设协议
  * @param [out] protocol 机器人外设协议号 4096-扩展轴控制卡；4097-ModbusSlave；4098-ModbusMaster
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetExDevProtocol(std::string para){
     int protocol;
@@ -3867,7 +3922,7 @@ std::string robot_command_thread::GetExDevProtocol(std::string para){
  * @param [out] servoSoftVersion 伺服驱动器软件版本，1-V1.0
  * @param [out] servoResolution 编码器分辨率
  * @param [out] axisMechTransRatio 机械传动比
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::AuxServoGetParam(std::string para){
     std::list<std::string> list;
@@ -3920,7 +3975,7 @@ std::string robot_command_thread::AuxServoGetEmergencyStopAcc(std::string para){
  * @brief 送气
  * @param [in] ioType io类型  0-控制器IO；1-扩展IO
  * @param [in] airControl 送气控制  0-停止送气；1-送气
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetAspirated(std::string para){
     std::list<std::string> list;
@@ -3936,7 +3991,7 @@ std::string robot_command_thread::SetAspirated(std::string para){
 /**
  * @brief 停止脚本
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ExtDevUDPClientComReset(std::string para){
     //empty
@@ -3946,7 +4001,7 @@ std::string robot_command_thread::ExtDevUDPClientComReset(std::string para){
 /**
  * @brief 停止脚本
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ExtDevUDPClientComClose(std::string para){
     //empty
@@ -3956,11 +4011,11 @@ std::string robot_command_thread::ExtDevUDPClientComClose(std::string para){
 /**
  * @brief 获取当前配置的控制器外设协议LUA文件名
  * @param name 4个lua文件名称 “CTRL_LUA_test.lua”
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetCtrlOpenLUAName(std::string para){
     std::string name[4];
-    
+
     int res = _ptr_robot->GetCtrlOpenLUAName(name);
     return std::string(std::to_string(res) + "," + std::string(name[0]) + "," + \
             std::string(name[1]) + "," + std::string(name[2]) + "," + \
@@ -3970,7 +4025,7 @@ std::string robot_command_thread::GetCtrlOpenLUAName(std::string para){
 /**
  * @brief 删除开放协议Lua文件
  * @param [in] fileName 要删除的开放协议lua文件名“CtrlDev_XXX.lua”
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::OpenLuaDelete(std::string para){
     std::list<std::string> list;
@@ -3984,7 +4039,7 @@ std::string robot_command_thread::OpenLuaDelete(std::string para){
 
 /**
  * @brief 删除所有开放协议Lua文件
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::AllOpenLuaDelete(std::string para){
     int res = _ptr_robot->AllOpenLuaDelete();
@@ -4009,7 +4064,7 @@ std::string robot_command_thread::AllOpenLuaDelete(std::string para){
 /**
  * @brief 查询SDK版本号
  * @return SDK版本号
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetSDKVersion(std::string para){
     char version;
@@ -4020,7 +4075,7 @@ std::string robot_command_thread::GetSDKVersion(std::string para){
 /**
  * @brief 查询控制器IP
  * @return 控制器IP
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetControllerIP(std::string para){
     char ip;
@@ -4031,7 +4086,7 @@ std::string robot_command_thread::GetControllerIP(std::string para){
 /**
  * @brief 查询机器人是否处于拖动示教模式
  * @return 0-非拖动示教模式，1-拖动示教模式
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::IsInDragTeach(std::string para){
     uint8_t state;
@@ -4043,7 +4098,7 @@ std::string robot_command_thread::IsInDragTeach(std::string para){
  * @param  [in] id  io编号，范围[0~15]
  * @param  [in] block  0-阻塞，1-非阻塞
  * @param  [out] result  0-低电平，1-高电平
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetDI(std::string para){
     std::list<std::string> list;
@@ -4061,7 +4116,7 @@ std::string robot_command_thread::GetDI(std::string para){
  * @param  [in] id  io编号，范围[0~1]
  * @param  [in] block  0-阻塞，1-非阻塞
  * @param  [out] result  0-低电平，1-高电平
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetToolDI(std::string para){
     std::list<std::string> list;
@@ -4080,7 +4135,7 @@ std::string robot_command_thread::GetToolDI(std::string para){
  * @param  [in]  status 0-关，1-开
  * @param  [in]  max_time  最大等待时间，单位ms
  * @param  [in]  opt  超时后策略，0-程序停止并提示超时，1-忽略超时提示程序继续执行，2-一直等待
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::WaitDI(std::string para){
     std::list<std::string> list;
@@ -4101,7 +4156,7 @@ std::string robot_command_thread::WaitDI(std::string para){
  * @param  [in]  status 0-关，1-开
  * @param  [in]  max_time  最大等待时间，单位ms
  * @param  [in]  opt  超时后策略，0-程序停止并提示超时，1-忽略超时提示程序继续执行，2-一直等待
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::WaitMultiDI(std::string para){
     std::list<std::string> list;
@@ -4122,7 +4177,7 @@ std::string robot_command_thread::WaitMultiDI(std::string para){
  * @param  [in]  status 0-关，1-开
  * @param  [in]  max_time  最大等待时间，单位ms
  * @param  [in]  opt  超时后策略，0-程序停止并提示超时，1-忽略超时提示程序继续执行，2-一直等待
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::WaitToolDI(std::string para){
     std::list<std::string> list;
@@ -4142,7 +4197,7 @@ std::string robot_command_thread::WaitToolDI(std::string para){
  * @param  [in] id  io编号，范围[0~1]
  * @param  [in] block  0-阻塞，1-非阻塞
  * @param  [out] result  输入电流或电压值百分比，范围[0~100]对应电流值[0~20mS]或电压[0~10V]
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetAI(std::string para){
     std::list<std::string> list;
@@ -4161,7 +4216,7 @@ std::string robot_command_thread::GetAI(std::string para){
  * @param  [in] id  io编号，范围[0]
  * @param  [in] block  0-阻塞，1-非阻塞
  * @param  [out] result  输入电流或电压值百分比，范围[0~100]对应电压[0~10V]
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetToolAI(std::string para){
     std::list<std::string> list;
@@ -4190,7 +4245,7 @@ std::string robot_command_thread::GetToolAI(std::string para){
  * @param  [in] offset_pos  位姿偏移量
  * @param  [in] spiral_param  螺旋参数
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::NewSpiral(std::string para){
     std::list<std::string> list;
@@ -4226,7 +4281,7 @@ std::string robot_command_thread::NewSpiral(std::string para){
 	spiral_param.rotaxis_add = std::stod(list.front().c_str());list.pop_front();
 	spiral_param.rot_direction = std::stoi(list.front().c_str());list.pop_front();
 	spiral_param.velAccMode = std::stoi(list.front().c_str());list.pop_front();
-    
+
     return std::to_string(_ptr_robot->NewSpiral(&pos,&cartpose,tool,user,vel,acc,\
         &eaxispos,ovl,offset_flag,&offsetpos,spiral_param));
 }
@@ -4234,7 +4289,7 @@ std::string robot_command_thread::NewSpiral(std::string para){
 /**
  * @brief 伺服运动开始，配合ServoJ、ServoCart指令使用
  * @param [in] comType 指令下发类型；0-xmlrpc；1-UDP(对应机器人20007端口)
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ServoMoveStart(std::string para){
     std::list<std::string> list;
@@ -4249,7 +4304,7 @@ std::string robot_command_thread::ServoMoveStart(std::string para){
 /**
  * @brief 伺服运动结束，配合ServoJ、ServoCart指令使用
  * @param [in] comType 指令下发类型；0-xmlrpc；1-UDP(对应机器人20007端口)
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ServoMoveEnd(std::string para){
     std::list<std::string> list;
@@ -4298,7 +4353,7 @@ std::string robot_command_thread::ServoCart(std::string para){
     float cmdT = std::stod(list.front().c_str());list.pop_front();
     float filterT = std::stod(list.front().c_str());list.pop_front();
     float gain = std::stod(list.front().c_str());list.pop_front();
-    
+
     return std::to_string(_ptr_robot->ServoCart(mode,&desc_pose,exaxis,pos_gain,acc,vel,cmdT,filterT,gain));
 }
 
@@ -4313,7 +4368,7 @@ std::string robot_command_thread::ServoCart(std::string para){
  * @param  [in] blendT [-1.0]-运动到位(阻塞)，[0~500.0]-平滑时间(非阻塞)，单位ms
  * @param  [in] config  关节空间配置，[-1]-参考当前关节位置解算，[0~7]-参考特定关节空间配置解算，默认为-1
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::MoveCart(std::string para){
     std::list<std::string> list;
@@ -4323,20 +4378,20 @@ std::string robot_command_thread::MoveCart(std::string para){
     _fillDescPose(list,desc_pose);
     int tool = std::stoi(list.front().c_str());list.pop_front();
     int user = std::stoi(list.front().c_str());list.pop_front();
-    
+
     float vel = std::stod(list.front().c_str());list.pop_front();
     float acc = std::stod(list.front().c_str());list.pop_front();
     float ovl = std::stod(list.front().c_str());list.pop_front();
     float blendT = std::stod(list.front().c_str());list.pop_front();
     int config = std::stoi(list.front().c_str());list.pop_front();
-    
+
     return std::to_string(_ptr_robot->MoveCart(&desc_pose,tool,user,vel,acc,\
         ovl,blendT,config));
 }
 
 /**
  * @brief 暂停运动
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::PauseMotion(std::string para){
     int res = _ptr_robot->PauseMotion();
@@ -4345,7 +4400,7 @@ std::string robot_command_thread::PauseMotion(std::string para){
 
 /**
  * @brief 恢复运动
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ResumeMotion(std::string para){
     int res = _ptr_robot->ResumeMotion();
@@ -4355,7 +4410,7 @@ std::string robot_command_thread::ResumeMotion(std::string para){
 /**
  * @brief 获取机器人末端点记录按钮状态
  * @param [out] state 按钮状态，0-按下，1-松开
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetAxlePointRecordBtnState(std::string para){
     uint8_t state;
@@ -4367,7 +4422,7 @@ std::string robot_command_thread::GetAxlePointRecordBtnState(std::string para){
 /**
  * @brief 获取机器人末端DO输出状态
  * @param [out] do_state DO输出状态，do0~do1对应bit1~bit2,从bit0开始
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetToolDO(std::string para){
     uint8_t do_state;
@@ -4380,7 +4435,7 @@ std::string robot_command_thread::GetToolDO(std::string para){
  * @brief 获取机器人控制器DO输出状态
  * @param [out] do_state_h DO输出状态，co0~co7对应bit0~bit7
  * @param [out] do_state_l DO输出状态，do0~do7对应bit0~bit7
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetDO(std::string para){
     uint8_t do_state_h;
@@ -4397,7 +4452,7 @@ std::string robot_command_thread::GetDO(std::string para){
  * @param  [in]  value 输入电流或电压值百分比，范围[0~100]对应电流值[0~20mS]或电压[0~10V]
  * @param  [in]  max_time  最大等待时间，单位ms
  * @param  [in]  opt  超时后策略，0-程序停止并提示超时，1-忽略超时提示程序继续执行，2-一直等待
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::WaitAI(std::string para){
     std::list<std::string> list;
@@ -4420,7 +4475,7 @@ std::string robot_command_thread::WaitAI(std::string para){
  * @param  [in]  value 输入电流或电压值百分比，范围[0~100]对应电压[0~10V]
  * @param  [in]  max_time  最大等待时间，单位ms
  * @param  [in]  opt  超时后策略，0-程序停止并提示超时，1-忽略超时提示程序继续执行，2-一直等待
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::WaitToolAI(std::string para){
     std::list<std::string> list;
@@ -4440,7 +4495,7 @@ std::string robot_command_thread::WaitToolAI(std::string para){
  * @brief  设置系统变量值
  * @param  [in]  id  变量编号，范围[1~20]
  * @param  [in]  value 变量值
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetSysVarValue(std::string para){
     std::list<std::string> list;
@@ -4456,7 +4511,7 @@ std::string robot_command_thread::SetSysVarValue(std::string para){
 /**
  * @brief 设置外部工具参考点-六点法
  * @param [in] point_num 点编号,范围[1~4]
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetExTCPPoint(std::string para){
     std::list<std::string> list;
@@ -4471,7 +4526,7 @@ std::string robot_command_thread::SetExTCPPoint(std::string para){
 /**
  * @brief  计算外部工具坐标系
  * @param [out] tcp_pose 外部工具坐标系
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ComputeExTCF(std::string para){
     DescPose tcp_pose;
@@ -4485,7 +4540,7 @@ std::string robot_command_thread::ComputeExTCF(std::string para){
 /**
  * @brief 设置工件参考点-三点法
  * @param [in] point_num 点编号,范围[1~3]
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetWObjCoordPoint(std::string para){
     std::list<std::string> list;
@@ -4502,7 +4557,7 @@ std::string robot_command_thread::SetWObjCoordPoint(std::string para){
  * @param [in] method 计算方法 0：原点-x轴-z轴  1：原点-x轴-xy平面
  * @param [in] refFrame 参考坐标系
  * @param [out] wobj_pose 工件坐标系
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ComputeWObjCoord(std::string para){
     std::list<std::string> list;
@@ -4522,7 +4577,7 @@ std::string robot_command_thread::ComputeWObjCoord(std::string para){
 /**
  * @brief  等待指定时间
  * @param  [in]  t_ms  单位ms
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::WaitMs(std::string para){
     std::list<std::string> list;
@@ -4537,7 +4592,7 @@ std::string robot_command_thread::WaitMs(std::string para){
 /**
  * @brief  设置负限位
  * @param  [in] limit 六个关节位置，单位deg
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetLimitNegative(std::string para){
     std::list<std::string> list;
@@ -4560,7 +4615,7 @@ std::string robot_command_thread::SetLimitNegative(std::string para){
  * @brief  获取机器人安装角度
  * @param  [out] yangle 倾斜角
  * @param  [out] zangle 旋转角
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetRobotInstallAngle(std::string para){
     float yangle;
@@ -4574,7 +4629,7 @@ std::string robot_command_thread::GetRobotInstallAngle(std::string para){
  * @brief  获取系统变量值
  * @param  [in] id 系统变量编号，范围[1~20]
  * @param  [out] value  系统变量值
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetSysVarValue(std::string para){
     std::list<std::string> list;
@@ -4592,7 +4647,7 @@ std::string robot_command_thread::GetSysVarValue(std::string para){
  * @brief  获取当前关节位置(角度)
  * @param  [in] flag 0-阻塞，1-非阻塞
  * @param  [out] jPos 六个关节位置，单位deg
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetActualJointPosDegree(std::string para){
     std::list<std::string> list;
@@ -4613,7 +4668,7 @@ std::string robot_command_thread::GetActualJointPosDegree(std::string para){
  * @brief  获取关节反馈速度-deg/s
  * @param  [in] flag 0-阻塞，1-非阻塞
  * @param  [out] speed [x,y,z,rx,ry,rz]速度
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetActualJointSpeedsDegree(std::string para){
     std::list<std::string> list;
@@ -4634,7 +4689,7 @@ std::string robot_command_thread::GetActualJointSpeedsDegree(std::string para){
  * @brief  获取关节反馈加速度-deg/s^2
  * @param  [in] flag 0-阻塞，1-非阻塞
  * @param  [out] acc 六个关节加速度
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetActualJointAccDegree(std::string para){
     std::list<std::string> list;
@@ -4656,7 +4711,7 @@ std::string robot_command_thread::GetActualJointAccDegree(std::string para){
  * @param  [in] flag 0-阻塞，1-非阻塞
  * @param  [out] tcp_speed 线性速度
  * @param  [out] ori_speed 姿态速度
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetTargetTCPCompositeSpeed(std::string para){
     std::list<std::string> list;
@@ -4677,7 +4732,7 @@ std::string robot_command_thread::GetTargetTCPCompositeSpeed(std::string para){
  * @param  [in] flag 0-阻塞，1-非阻塞
  * @param  [out] tcp_speed 线性速度
  * @param  [out] ori_speed 姿态速度
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetActualTCPCompositeSpeed(std::string para){
     std::list<std::string> list;
@@ -4697,7 +4752,7 @@ std::string robot_command_thread::GetActualTCPCompositeSpeed(std::string para){
  * @brief  获取TCP指令速度
  * @param  [in] flag 0-阻塞，1-非阻塞
  * @param  [out] speed [x,y,z,rx,ry,rz]速度
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetTargetTCPSpeed(std::string para){
     std::list<std::string> list;
@@ -4718,7 +4773,7 @@ std::string robot_command_thread::GetTargetTCPSpeed(std::string para){
  * @brief  获取TCP反馈速度
  * @param  [in] flag 0-阻塞，1-非阻塞
  * @param  [out] speed [x,y,z,rx,ry,rz]速度
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetActualTCPSpeed(std::string para){
     std::list<std::string> list;
@@ -4739,7 +4794,7 @@ std::string robot_command_thread::GetActualTCPSpeed(std::string para){
  * @brief  获取当前工具位姿
  * @param  [in] flag  0-阻塞，1-非阻塞
  * @param  [out] desc_pos  工具位姿
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetActualTCPPose(std::string para){
     std::list<std::string> list;
@@ -4759,7 +4814,7 @@ std::string robot_command_thread::GetActualTCPPose(std::string para){
  * @brief  获取当前工具坐标系编号
  * @param  [in] flag  0-阻塞，1-非阻塞
  * @param  [out] id  工具坐标系编号
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetActualTCPNum(std::string para){
     std::list<std::string> list;
@@ -4776,7 +4831,7 @@ std::string robot_command_thread::GetActualTCPNum(std::string para){
  * @brief  获取当前工件坐标系编号
  * @param  [in] flag  0-阻塞，1-非阻塞
  * @param  [out] id  工件坐标系编号
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetActualWObjNum(std::string para){
     std::list<std::string> list;
@@ -4793,7 +4848,7 @@ std::string robot_command_thread::GetActualWObjNum(std::string para){
  * @brief  获取当前末端法兰位姿
  * @param  [in] flag  0-阻塞，1-非阻塞
  * @param  [out] desc_pos  法兰位姿
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetActualToolFlangePose(std::string para){
     std::list<std::string> list;
@@ -4815,7 +4870,7 @@ std::string robot_command_thread::GetActualToolFlangePose(std::string para){
  * @param  [in] desc_pos 笛卡尔位姿
  * @param  [in] joint_pos_ref 参考关节位置
  * @param  [out] joint_pos 关节位置
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetInverseKinRef(std::string para){
     std::list<std::string> list;
@@ -4841,7 +4896,7 @@ std::string robot_command_thread::GetInverseKinRef(std::string para){
  * @param  [in] desc_pos 笛卡尔位姿
  * @param  [in] joint_pos_ref 参考关节位置
  * @param  [out] result 0-无解，1-有解
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetInverseKinHasSolution(std::string para){
     std::list<std::string> list;
@@ -4895,7 +4950,7 @@ std::string robot_command_thread::GetInverseKinExaxis(std::string para){
  * @brief  正运动学求解
  * @param  [in] joint_pos 关节位置
  * @param  [out] desc_pos 笛卡尔位姿
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetForwardKin(std::string para){
     std::list<std::string> list;
@@ -4916,7 +4971,7 @@ std::string robot_command_thread::GetForwardKin(std::string para){
  * @brief 获取当前关节转矩
  * @param  [in] flag 0-阻塞，1-非阻塞
  * @param  [out] torques 关节转矩
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetJointTorques(std::string para){
     std::list<std::string> list;
@@ -4936,7 +4991,7 @@ std::string robot_command_thread::GetJointTorques(std::string para){
  * @brief  获取当前负载的重量
  * @param  [in] flag 0-阻塞，1-非阻塞
  * @param  [out] weight 负载重量，单位kg
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetTargetPayload(std::string para){
     std::list<std::string> list;
@@ -4953,7 +5008,7 @@ std::string robot_command_thread::GetTargetPayload(std::string para){
  * @brief  获取当前负载的质心
  * @param  [in] flag 0-阻塞，1-非阻塞
  * @param  [out] cog 负载质心，单位mm
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetTargetPayloadCog(std::string para){
     std::list<std::string> list;
@@ -4971,7 +5026,7 @@ std::string robot_command_thread::GetTargetPayloadCog(std::string para){
  * @brief  获取当前工件坐标系
  * @param  [in] flag 0-阻塞，1-非阻塞
  * @param  [out] desc_pos 工件坐标系位姿
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetWObjOffset(std::string para){
     std::list<std::string> list;
@@ -4992,7 +5047,7 @@ std::string robot_command_thread::GetWObjOffset(std::string para){
  * @param  [in] flag 0-阻塞，1-非阻塞
  * @param  [out] negative  负限位角度，单位deg
  * @param  [out] positive  正限位角度，单位deg
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetJointSoftLimitDeg(std::string para){
     std::list<std::string> list;
@@ -5015,7 +5070,7 @@ std::string robot_command_thread::GetJointSoftLimitDeg(std::string para){
 /**
  * @brief  获取系统时间
  * @param  [out] t_ms 单位ms
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetSystemClock(std::string para){
     float t_ms;
@@ -5026,7 +5081,7 @@ std::string robot_command_thread::GetSystemClock(std::string para){
 /**
  * @brief  获取机器人当前关节位置
  * @param  [out]  config  关节空间配置，范围[0~7]
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetRobotCurJointsConfig(std::string para){
     int config;
@@ -5037,7 +5092,7 @@ std::string robot_command_thread::GetRobotCurJointsConfig(std::string para){
 /**
  * @brief  获取机器人当前速度
  * @param  [out]  vel  速度，单位mm/s
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetDefaultTransVel(std::string para){
     float vel;
@@ -5048,7 +5103,7 @@ std::string robot_command_thread::GetDefaultTransVel(std::string para){
 /**
  * @brief  查询机器人运动是否完成
  * @param  [out]  state  0-未完成，1-完成
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetRobotMotionDone(std::string para){
     uint8_t state;
@@ -5060,7 +5115,7 @@ std::string robot_command_thread::GetRobotMotionDone(std::string para){
  * @brief  查询机器人错误码
  * @param  [out]  maincode  主错误码
  * @param  [out]  subcode   子错误码
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetRobotErrorCode(std::string para){
     int maincode;
@@ -5073,7 +5128,7 @@ std::string robot_command_thread::GetRobotErrorCode(std::string para){
  * @brief  查询机器人示教管理点位数据
  * @param  [in]  name  点位名
  * @param  [out]  data   点位数据
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetRobotTeachingPoint(std::string para){
     std::list<std::string> list;
@@ -5100,7 +5155,7 @@ std::string robot_command_thread::GetRobotTeachingPoint(std::string para){
 /**
  * @brief  查询机器人运动队列缓存长度
  * @param  [out]  len  缓存长度
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetMotionQueueLength(std::string para){
     int len;
@@ -5115,7 +5170,7 @@ std::string robot_command_thread::GetMotionQueueLength(std::string para){
  * @param  [in] period_ms  数据采样周期，固定值2ms或4ms或8ms
  * @param  [in] di_choose  DI选择,bit0~bit7对应控制箱DI0~DI7，bit8~bit9对应末端DI0~DI1，0-不选择，1-选择
  * @param  [in] do_choose  DO选择,bit0~bit7对应控制箱DO0~DO7，bit8~bit9对应末端DO0~DO1，0-不选择，1-选择
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetTPDParam(std::string para){
     std::list<std::string> list;
@@ -5140,7 +5195,7 @@ std::string robot_command_thread::SetTPDParam(std::string para){
  * @param  [in] period_ms  数据采样周期，固定值2ms或4ms或8ms
  * @param  [in] di_choose  DI选择,bit0~bit7对应控制箱DI0~DI7，bit8~bit9对应末端DI0~DI1，0-不选择，1-选择
  * @param  [in] do_choose  DO选择,bit0~bit7对应控制箱DO0~DO7，bit8~bit9对应末端DO0~DO1，0-不选择，1-选择
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetTPDStart(std::string para){
     std::list<std::string> list;
@@ -5160,7 +5215,7 @@ std::string robot_command_thread::SetTPDStart(std::string para){
 
 /**
  * @brief  停止轨迹记录
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetWebTPDStop(std::string para){
     int res = _ptr_robot->SetWebTPDStop();
@@ -5170,12 +5225,12 @@ std::string robot_command_thread::SetWebTPDStop(std::string para){
 /**
  * @brief  删除轨迹记录
  * @param  [in] name  轨迹文件名
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetTPDDelete(std::string para){
     std::list<std::string> list;
     _splitString2List(para,list);
-    
+
     char name[30];
     list.front().copy(name,list.front().size());list.pop_front();
 
@@ -5186,7 +5241,7 @@ std::string robot_command_thread::SetTPDDelete(std::string para){
 /**
  * @brief  轨迹预加载
  * @param  [in] name  轨迹文件名
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::LoadTPD(std::string para){
     std::list<std::string> list;
@@ -5194,7 +5249,7 @@ std::string robot_command_thread::LoadTPD(std::string para){
 
     char name[30];
     list.front().copy(name,list.front().size());list.pop_front();
-    
+
     int res = _ptr_robot->LoadTPD(name);
     return std::string(std::to_string(res));
 }
@@ -5202,7 +5257,7 @@ std::string robot_command_thread::LoadTPD(std::string para){
 /**
  * @brief  获取轨迹起始位姿
  * @param  [in] name 轨迹文件名
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetTPDStartPose(std::string para){
     std::list<std::string> list;
@@ -5210,7 +5265,7 @@ std::string robot_command_thread::GetTPDStartPose(std::string para){
 
     char name[30];
     list.front().copy(name,list.front().size());list.pop_front();
-    
+
     DescPose desc_pose;
     int res = _ptr_robot->GetTPDStartPose(name,&desc_pose);
     return std::string(std::to_string(res) + "," + std::to_string(desc_pose.tran.x) + "," + \
@@ -5224,7 +5279,7 @@ std::string robot_command_thread::GetTPDStartPose(std::string para){
  * @param  [in] name  轨迹文件名
  * @param  [in] blend 0-不平滑，1-平滑
  * @param  [in] ovl  速度缩放百分比，范围[0~100]
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::MoveTPD(std::string para){
     std::list<std::string> list;
@@ -5234,7 +5289,7 @@ std::string robot_command_thread::MoveTPD(std::string para){
     list.front().copy(name,list.front().size());list.pop_front();
     uint8_t blend = std::stoi(list.front());list.pop_front();
     float ovl = std::stod(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->MoveTPD(name,blend,ovl);
     return std::string(std::to_string(res));
 }
@@ -5242,7 +5297,7 @@ std::string robot_command_thread::MoveTPD(std::string para){
 /**
  * @brief  设置轨迹运行中的力和扭矩
  * @param  [in] ft 三个方向的力和扭矩，单位N和Nm
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetTrajectoryJForceTorque(std::string para){
     std::list<std::string> list;
@@ -5254,7 +5309,7 @@ std::string robot_command_thread::SetTrajectoryJForceTorque(std::string para){
     ft.tx = std::stod(list.front());list.pop_front();
     ft.ty = std::stod(list.front());list.pop_front();
     ft.tz = std::stod(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->SetTrajectoryJForceTorque(&ft);
     return std::string(std::to_string(res));
 }
@@ -5262,13 +5317,13 @@ std::string robot_command_thread::SetTrajectoryJForceTorque(std::string para){
 /**
  * @brief  设置轨迹运行中的沿x方向的力
  * @param  [in] fx 沿x方向的力，单位N
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetTrajectoryJForceFx(std::string para){
     std::list<std::string> list;
     _splitString2List(para,list);
     double fx = std::stod(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->SetTrajectoryJForceFx(fx);
     return std::string(std::to_string(res));
 }
@@ -5276,13 +5331,13 @@ std::string robot_command_thread::SetTrajectoryJForceFx(std::string para){
 /**
  * @brief  设置轨迹运行中的沿y方向的力
  * @param  [in] fy 沿y方向的力，单位N
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetTrajectoryJForceFy(std::string para){
     std::list<std::string> list;
     _splitString2List(para,list);
     double fy = std::stod(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->SetTrajectoryJForceFy(fy);
     return std::string(std::to_string(res));
 }
@@ -5290,13 +5345,13 @@ std::string robot_command_thread::SetTrajectoryJForceFy(std::string para){
 /**
  * @brief  设置轨迹运行中的沿z方向的力
  * @param  [in] fz 沿x方向的力，单位N
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetTrajectoryJForceFz(std::string para){
     std::list<std::string> list;
     _splitString2List(para,list);
     double fz = std::stod(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->SetTrajectoryJForceFz(fz);
     return std::string(std::to_string(res));
 }
@@ -5304,13 +5359,13 @@ std::string robot_command_thread::SetTrajectoryJForceFz(std::string para){
 /**
  * @brief  设置轨迹运行中的绕x轴的扭矩
  * @param  [in] tx 绕x轴的扭矩，单位Nm
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetTrajectoryJTorqueTx(std::string para){
     std::list<std::string> list;
     _splitString2List(para,list);
     double tx = std::stod(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->SetTrajectoryJTorqueTx(tx);
     return std::string(std::to_string(res));
 }
@@ -5318,13 +5373,13 @@ std::string robot_command_thread::SetTrajectoryJTorqueTx(std::string para){
 /**
  * @brief  设置轨迹运行中的绕y轴的扭矩
  * @param  [in] ty 绕y轴的扭矩，单位Nm
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetTrajectoryJTorqueTy(std::string para){
     std::list<std::string> list;
     _splitString2List(para,list);
     double ty = std::stod(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->SetTrajectoryJTorqueTy(ty);
     return std::string(std::to_string(res));
 }
@@ -5332,13 +5387,13 @@ std::string robot_command_thread::SetTrajectoryJTorqueTy(std::string para){
 /**
  * @brief  设置轨迹运行中的绕z轴的扭矩
  * @param  [in] tz 绕z轴的扭矩，单位Nm
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetTrajectoryJTorqueTz(std::string para){
     std::list<std::string> list;
     _splitString2List(para,list);
     double tz = std::stod(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->SetTrajectoryJTorqueTz(tz);
     return std::string(std::to_string(res));
 }
@@ -5347,7 +5402,7 @@ std::string robot_command_thread::SetTrajectoryJTorqueTz(std::string para){
  * @brief  设置开机自动加载默认的作业程序
  * @param  [in] flag  0-开机不自动加载默认程序，1-开机自动加载默认程序
  * @param  [in] program_name 作业程序名及路径，如"/fruser/movej.lua"，其中"/fruser/"为固定路径
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::LoadDefaultProgConfig(std::string para){
     std::list<std::string> list;
@@ -5356,7 +5411,7 @@ std::string robot_command_thread::LoadDefaultProgConfig(std::string para){
     uint8_t flag = std::stoi(list.front());list.pop_front();
     char program_name[64];
     list.front().copy(program_name,list.front().size());list.pop_front();
-    
+
     int res = _ptr_robot->LoadDefaultProgConfig(flag,program_name);
     return std::string(std::to_string(res));
 }
@@ -5364,7 +5419,7 @@ std::string robot_command_thread::LoadDefaultProgConfig(std::string para){
 /**
  * @brief  加载指定的作业程序
  * @param  [in] program_name 作业程序名及路径，如"/fruser/movej.lua"，其中"/fruser/"为固定路径
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ProgramLoad(std::string para){
     std::list<std::string> list;
@@ -5372,7 +5427,7 @@ std::string robot_command_thread::ProgramLoad(std::string para){
 
     char program_name[64];
     list.front().copy(program_name,list.front().size());list.pop_front();
-    
+
     int res = _ptr_robot->ProgramLoad(program_name);
     return std::string(std::to_string(res));
 }
@@ -5380,7 +5435,7 @@ std::string robot_command_thread::ProgramLoad(std::string para){
 /**
  * @brief  获取已加载的作业程序名
  * @param  [out] program_name 作业程序名及路径，如"/fruser/movej.lua"，其中"/fruser/"为固定路径
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetLoadedProgram(std::string para){
     std::list<std::string> list;
@@ -5388,7 +5443,7 @@ std::string robot_command_thread::GetLoadedProgram(std::string para){
 
     char program_name[64];
     list.front().copy(program_name,list.front().size());list.pop_front();
-    
+
     int res = _ptr_robot->GetLoadedProgram(program_name);
     return std::string(std::to_string(res));
 }
@@ -5396,17 +5451,17 @@ std::string robot_command_thread::GetLoadedProgram(std::string para){
 /**
  * @brief  获取当前机器人作业程序执行的行号
  * @param  [out] line  行号
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetCurrentLine(std::string para){
-    int line;     
+    int line;
     int res = _ptr_robot->GetCurrentLine(&line);
     return std::string(std::to_string(res) + "," + std::to_string(line));
 }
 
 /**
  * @brief  运行当前加载的作业程序
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ProgramRun(std::string para){
     int res = _ptr_robot->ProgramRun();
@@ -5415,7 +5470,7 @@ std::string robot_command_thread::ProgramRun(std::string para){
 
 /**
  * @brief  暂停当前运行的作业程序
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ProgramPause(std::string para){
     int res = _ptr_robot->ProgramPause();
@@ -5424,7 +5479,7 @@ std::string robot_command_thread::ProgramPause(std::string para){
 
 /**
  * @brief  恢复当前暂停的作业程序
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ProgramResume(std::string para){
     int res = _ptr_robot->ProgramResume();
@@ -5433,7 +5488,7 @@ std::string robot_command_thread::ProgramResume(std::string para){
 
 /**
  * @brief  终止当前运行的作业程序
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ProgramStop(std::string para){
     int res = _ptr_robot->ProgramStop();
@@ -5443,7 +5498,7 @@ std::string robot_command_thread::ProgramStop(std::string para){
 /**
  * @brief  获取机器人作业程序执行状态
  * @param  [out]  state 1-程序停止或无程序运行，2-程序运行中，3-程序暂停
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetProgramState(std::string para){
     uint8_t state;
@@ -5457,7 +5512,7 @@ std::string robot_command_thread::GetProgramState(std::string para){
  * @param  [in] device  设备号，Robotiq(0-2F-85系列)，慧灵(0-NK系列,1-Z-EFG-100)，天机(0-TEG-110)，大寰(0-PGI-140)，知行(0-CTPM2F20)
  * @param  [in] softvesion  软件版本号，暂不使用，默认为0
  * @param  [in] bus 设备挂在末端总线位置，暂不使用，默认为0
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetGripperConfig(std::string para){
     std::list<std::string> list;
@@ -5479,7 +5534,7 @@ std::string robot_command_thread::SetGripperConfig(std::string para){
  *@param  [out] device  设备号，Robotiq(0-2F-85系列)，慧灵(0-NK系列,1-Z-EFG-100)，天机(0-TEG-110)，大寰(0-PGI-140)，知行(0-CTPM2F20)
  *@param  [out] softvesion  软件版本号，暂不使用，默认为0
  *@param  [out] bus 设备挂在末端总线位置，暂不使用，默认为0
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetGripperConfig(std::string para){
     int company;
@@ -5497,7 +5552,7 @@ std::string robot_command_thread::GetGripperConfig(std::string para){
  * @brief  获取夹爪运动状态
  * @param  [out] fault  0-无错误，1-有错误
  * @param  [out] staus  0-运动未完成，1-运动完成
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetGripperMotionDone(std::string para){
     uint16_t fault;
@@ -5512,7 +5567,7 @@ std::string robot_command_thread::GetGripperMotionDone(std::string para){
  * @brief  获取夹爪激活状态
  * @param  [out] fault  0-无错误，1-有错误
  * @param  [out] status  bit0~bit15对应夹爪编号0~15，bit=0为未激活，bit=1为激活
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetGripperActivateStatus(std::string para){
     uint16_t fault;
@@ -5527,7 +5582,7 @@ std::string robot_command_thread::GetGripperActivateStatus(std::string para){
  * @brief  获取夹爪位置
  * @param  [out] fault  0-无错误，1-有错误
  * @param  [out] position  位置百分比，范围0~100%
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetGripperCurPosition(std::string para){
     uint16_t fault;
@@ -5542,7 +5597,7 @@ std::string robot_command_thread::GetGripperCurPosition(std::string para){
  * @brief  获取夹爪速度
  * @param  [out] fault  0-无错误，1-有错误
  * @param  [out] speed  速度百分比，范围0~100%
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetGripperCurSpeed(std::string para){
     uint16_t fault;
@@ -5557,7 +5612,7 @@ std::string robot_command_thread::GetGripperCurSpeed(std::string para){
  * @brief  获取夹爪电流
  * @param  [out] fault  0-无错误，1-有错误
  * @param  [out] current  电流百分比，范围0~100%
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetGripperCurCurrent(std::string para){
     uint16_t fault;
@@ -5572,7 +5627,7 @@ std::string robot_command_thread::GetGripperCurCurrent(std::string para){
  * @brief  获取夹爪电压
  * @param  [out] fault  0-无错误，1-有错误
  * @param  [out] voltage  电压,单位0.1V
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetGripperVoltage(std::string para){
     uint16_t fault;
@@ -5587,7 +5642,7 @@ std::string robot_command_thread::GetGripperVoltage(std::string para){
  * @brief  获取夹爪温度
  * @param  [out] fault  0-无错误，1-有错误
  * @param  [out] temp  温度，单位℃
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetGripperTemp(std::string para){
     uint16_t fault;
@@ -5602,7 +5657,7 @@ std::string robot_command_thread::GetGripperTemp(std::string para){
  * @brief  获取旋转夹爪的旋转圈数
  * @param  [out] fault  0-无错误，1-有错误
  * @param  [out] num  旋转圈数
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetGripperRotNum(std::string para){
     uint16_t fault;
@@ -5617,7 +5672,7 @@ std::string robot_command_thread::GetGripperRotNum(std::string para){
  * @brief  获取旋转夹爪的旋转速度
  * @param  [out] fault  0-无错误，1-有错误
  * @param  [out] speed  旋转速度百分比
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetGripperRotSpeed(std::string para){
     uint16_t fault;
@@ -5632,7 +5687,7 @@ std::string robot_command_thread::GetGripperRotSpeed(std::string para){
  * @brief  获取旋转夹爪的旋转力矩
  * @param  [out] fault  0-无错误，1-有错误
  * @param  [out] torque  旋转力矩百分比
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetGripperRotTorque(std::string para){
     uint16_t fault;
@@ -5649,7 +5704,7 @@ std::string robot_command_thread::GetGripperRotTorque(std::string para){
  * @param  [in] zlength   z轴偏移量
  * @param  [in] zangle    绕z轴旋转偏移量
  * @param  [out] pre_pos  预抓取点
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ComputePrePick(std::string para){
     std::list<std::string> list;
@@ -5675,7 +5730,7 @@ std::string robot_command_thread::ComputePrePick(std::string para){
  * @param  [in] zlength   z轴偏移量
  * @param  [in] zangle    绕z轴旋转偏移量
  * @param  [out] post_pos 撤退点
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ComputePostPick(std::string para){
     std::list<std::string> list;
@@ -5701,7 +5756,7 @@ std::string robot_command_thread::ComputePostPick(std::string para){
  * @param  [in] device  设备号，坤维(0-KWR75B)，航天十一院(0-MCS6A-200-4)，ATI(0-AXIA80-M8)，中科米点(0-MST2010)，伟航敏芯(0-WHC6L-YB-10A)，NBIT(0-XLH93003ACS)，鑫精诚XJC(0-XJC-6F-D82)，NSR(0-NSR-FTSensorA)
  * @param  [in] softvesion  软件版本号，暂不使用，默认为0
  * @param  [in] bus 设备挂在末端总线位置，暂不使用，默认为0
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::FT_SetConfig(std::string para){
     std::list<std::string> list;
@@ -5722,7 +5777,7 @@ std::string robot_command_thread::FT_SetConfig(std::string para){
  * @param  [out] device  设备号，暂不使用，默认为0
  * @param  [out] softvesion  软件版本号，暂不使用，默认为0
  * @param  [out] bus 设备挂在末端总线位置，暂不使用，默认为0
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::FT_GetConfig(std::string para){
     int company;
@@ -5739,7 +5794,7 @@ std::string robot_command_thread::FT_GetConfig(std::string para){
 /**
  * @brief  力传感器激活
  * @param  [in] act  0-复位，1-激活
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::FT_Activate(std::string para){
     std::list<std::string> list;
@@ -5754,7 +5809,7 @@ std::string robot_command_thread::FT_Activate(std::string para){
 /**
  * @brief  力传感器校零
  * @param  [in] act  0-去除零点，1-零点矫正
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::FT_SetZero(std::string para){
     std::list<std::string> list;
@@ -5770,7 +5825,7 @@ std::string robot_command_thread::FT_SetZero(std::string para){
  * @brief  设置力传感器参考坐标系
  * @param  [in] ref  0-工具坐标系，1-基坐标系,2-自定义坐标系
  * @param  [in] coord  自定义坐标系值
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::FT_SetRCS(std::string para){
     std::list<std::string> list;
@@ -5787,7 +5842,7 @@ std::string robot_command_thread::FT_SetRCS(std::string para){
 /**
  * @brief  负载重量辨识记录
  * @param  [in] id  传感器坐标系编号，范围[1~14]
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::FT_PdIdenRecord(std::string para){
     std::list<std::string> list;
@@ -5802,7 +5857,7 @@ std::string robot_command_thread::FT_PdIdenRecord(std::string para){
 /**
  * @brief  负载重量辨识计算
  * @param  [out] weight  负载重量，单位kg
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::FT_PdIdenCompute(std::string para){
     float weight;
@@ -5831,7 +5886,7 @@ std::string robot_command_thread::FT_PdCogIdenRecord(std::string para){
 /**
  * @brief  负载质心辨识计算
  * @param  [out] cog  负载质心，单位mm
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::FT_PdCogIdenCompute(std::string para){
     DescTran cog;
@@ -5845,7 +5900,7 @@ std::string robot_command_thread::FT_PdCogIdenCompute(std::string para){
  * @brief  获取参考坐标系下力/扭矩数据
  * @param  [in] flag 0-阻塞，1-非阻塞
  * @param  [out] ft  力/扭矩，fx,fy,fz,tx,ty,tz
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::FT_GetForceTorqueRCS(std::string para){
     std::list<std::string> list;
@@ -5866,7 +5921,7 @@ std::string robot_command_thread::FT_GetForceTorqueRCS(std::string para){
  * @brief  获取力传感器原始力/扭矩数据
  * @param  [in] flag 0-阻塞，1-非阻塞
  * @param  [out] ft  力/扭矩，fx,fy,fz,tx,ty,tz
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::FT_GetForceTorqueOrigin(std::string para){
     std::list<std::string> list;
@@ -5892,7 +5947,7 @@ std::string robot_command_thread::FT_GetForceTorqueOrigin(std::string para){
  * @param  [in] max_threshold 最大阈值
  * @param  [in] min_threshold 最小阈值
  * @note   力/扭矩检测范围：(ft-min_threshold, ft+max_threshold)
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::FT_Guard(std::string para){
     std::list<std::string> list;
@@ -5944,13 +5999,13 @@ std::string robot_command_thread::FT_Guard(std::string para){
  * @param  [in] ILC_sign ILC启停控制， 0-停止，1-训练，2-实操
  * @param  [in] max_dis 最大调整距离，单位mm
  * @param  [in] max_ang 最大调整角度，单位deg
- * @param  [in] M 质量参数 
+ * @param  [in] M 质量参数
  * @param  [in] B 阻尼参数
  * @param  [in] polishRadio 打磨半径，单位mm
  * @param  [in] filter_Sign 滤波开启标志 0-关；1-开，默认关闭
  * @param  [in] posAdapt_sign 姿态顺应开启标志 0-关；1-开，默认关闭
  * @param  [in] isNoBlock 阻塞标志，0-阻塞；1-非阻塞
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::FT_Control(std::string para){
     std::list<std::string> list;
@@ -6058,7 +6113,7 @@ std::string robot_command_thread::FT_Control(std::string para){
  * @param  [in] ft 插入动作触发力，单位N
  * @param  [in] max_t_ms 最大探索时间，单位ms
  * @param  [in] max_vel 最大线速度，单位mm/s
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::FT_SpiralSearch(std::string para){
     std::list<std::string> list;
@@ -6084,7 +6139,7 @@ std::string robot_command_thread::FT_SpiralSearch(std::string para){
  * @param  [in] max_angAcc 最大旋转加速度，单位deg/s^2，暂不使用，默认为0
  * @param  [in] rotorn  旋转方向，1-顺时针，2-逆时针
  * @param  [in] strategy 未检测到力/力矩的处理策略，0-报错；1-警告，继续运动
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::FT_RotInsertion(std::string para){
     std::list<std::string> list;
@@ -6111,7 +6166,7 @@ std::string robot_command_thread::FT_RotInsertion(std::string para){
  * @param  [in] lin_a 直线加速度，单位mm/s^2，暂不使用
  * @param  [in] max_dis 最大插入距离，单位mm
  * @param  [in] linorn  插入方向，0-负方向，1-正方向
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::FT_LinInsertion(std::string para){
     std::list<std::string> list;
@@ -6137,7 +6192,7 @@ std::string robot_command_thread::FT_LinInsertion(std::string para){
  * @param  [in] lin_a 探索直线加速度，单位mm/s^2，暂不使用，默认为0
  * @param  [in] max_dis 最大探索距离，单位mm
  * @param  [in] ft  动作终止力阈值，单位N
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::FT_FindSurface(std::string para){
     std::list<std::string> list;
@@ -6157,7 +6212,7 @@ std::string robot_command_thread::FT_FindSurface(std::string para){
 
 /**
  * @brief  计算中间平面位置开始
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::FT_CalCenterStart(std::string para){
     int res = _ptr_robot->FT_CalCenterStart();
@@ -6167,7 +6222,7 @@ std::string robot_command_thread::FT_CalCenterStart(std::string para){
 /**
  * @brief  计算中间平面位置结束
  * @param  [out] pos 中间平面位姿
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::FT_CalCenterEnd(std::string para){
     DescPose pos;
@@ -6183,7 +6238,7 @@ std::string robot_command_thread::FT_CalCenterEnd(std::string para){
  * @brief  柔顺控制开启
  * @param  [in] p 位置调节系数或柔顺系数
  * @param  [in] force 柔顺开启力阈值，单位N
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::FT_ComplianceStart(std::string para){
     std::list<std::string> list;
@@ -6198,7 +6253,7 @@ std::string robot_command_thread::FT_ComplianceStart(std::string para){
 
 /**
  * @brief  柔顺控制关闭
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::FT_ComplianceStop(std::string para){
     int res = _ptr_robot->FT_ComplianceStop();
@@ -6207,7 +6262,7 @@ std::string robot_command_thread::FT_ComplianceStop(std::string para){
 
 /**
  * @brief  负载辨识初始化
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::LoadIdentifyDynFilterInit(std::string para){
     int res = _ptr_robot->LoadIdentifyDynFilterInit();
@@ -6216,7 +6271,7 @@ std::string robot_command_thread::LoadIdentifyDynFilterInit(std::string para){
 
 /**
  * @brief  负载辨识初始化
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::LoadIdentifyDynVarInit(std::string para){
     int res = _ptr_robot->LoadIdentifyDynVarInit();
@@ -6228,7 +6283,7 @@ std::string robot_command_thread::LoadIdentifyDynVarInit(std::string para){
  * @param [in] joint_torque 关节扭矩
  * @param [in] joint_pos 关节位置
  * @param [in] t 采样周期
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::LoadIdentifyMain(std::string para){
     std::list<std::string> list;
@@ -6259,7 +6314,7 @@ std::string robot_command_thread::LoadIdentifyMain(std::string para){
  * @param [in] gain
  * @param [out] weight 负载重量
  * @param [out] cog 负载质心
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::LoadIdentifyGetResult(std::string para){
     std::list<std::string> list;
@@ -6281,7 +6336,7 @@ std::string robot_command_thread::LoadIdentifyGetResult(std::string para){
 /**
  * @brief 传动带启动、停止
  * @param [in] status 状态，1-启动，0-停止
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ConveyorStartEnd(std::string para){
     std::list<std::string> list;
@@ -6295,7 +6350,7 @@ std::string robot_command_thread::ConveyorStartEnd(std::string para){
 
 /**
  * @brief 记录IO检测点
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ConveyorPointIORecord(std::string para){
     int res = _ptr_robot->ConveyorPointIORecord();
@@ -6304,7 +6359,7 @@ std::string robot_command_thread::ConveyorPointIORecord(std::string para){
 
 /**
  * @brief 记录A点
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ConveyorPointARecord(std::string para){
     int res = _ptr_robot->ConveyorPointARecord();
@@ -6313,7 +6368,7 @@ std::string robot_command_thread::ConveyorPointARecord(std::string para){
 
 /**
  * @brief 记录参考点
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ConveyorRefPointRecord(std::string para){
     int res = _ptr_robot->ConveyorRefPointRecord();
@@ -6322,7 +6377,7 @@ std::string robot_command_thread::ConveyorRefPointRecord(std::string para){
 
 /**
  * @brief 记录B点
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ConveyorPointBRecord(std::string para){
     int res = _ptr_robot->ConveyorPointBRecord();
@@ -6332,7 +6387,7 @@ std::string robot_command_thread::ConveyorPointBRecord(std::string para){
 /**
  * @brief 传送带工件IO检测
  * @param [in] max_t 最大检测时间，单位ms
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ConveyorIODetect(std::string para){
     std::list<std::string> list;
@@ -6347,7 +6402,7 @@ std::string robot_command_thread::ConveyorIODetect(std::string para){
 /**
  * @brief 获取物体当前位置
  * @param [in] mode
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ConveyorGetTrackData(std::string para){
     std::list<std::string> list;
@@ -6362,7 +6417,7 @@ std::string robot_command_thread::ConveyorGetTrackData(std::string para){
 /**
  * @brief 传动带跟踪开始
  * @param [in] status 状态，1-启动，0-停止
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ConveyorTrackStart(std::string para){
     std::list<std::string> list;
@@ -6376,7 +6431,7 @@ std::string robot_command_thread::ConveyorTrackStart(std::string para){
 
 /**
  * @brief 传动带跟踪停止
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ConveyorTrackEnd(std::string para){
     int res = _ptr_robot->ConveyorTrackEnd();
@@ -6390,11 +6445,11 @@ std::string robot_command_thread::ConveyorTrackEnd(std::string para){
  * @param [in] para[2] 编码器转一圈传送带行走距离
  * @param [in] para[3] 工件坐标系编号 针对跟踪运动功能选择工件坐标系编号，跟踪抓取、TPD跟踪设为0
  * @param [in] para[4] 是否配视觉  0 不配  1 配
- * @param [in] para[5] 速度比  针对传送带跟踪抓取选项（1-100）  其他选项默认为1 
+ * @param [in] para[5] 速度比  针对传送带跟踪抓取选项（1-100）  其他选项默认为1
  * @param [in] followType 跟踪运动类型，0-跟踪运动；1-追检运动
  * @param [in] startDis 追检抓取需要设置， 跟踪起始距离， -1：自动计算(工件到达机器人下方后自动追检)，单位mm， 默认值0
  * @param [in] endDis 追检抓取需要设置，跟踪终止距离， 单位mm， 默认值100
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ConveyorSetParam(std::string para){
     std::list<std::string> list;
@@ -6418,7 +6473,7 @@ std::string robot_command_thread::ConveyorSetParam(std::string para){
 /**
  * @brief 传动带抓取点补偿
  * @param [in] cmp 补偿位置 double[3]{x, y, z}
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ConveyorCatchPointComp(std::string para){
     std::list<std::string> list;
@@ -6436,7 +6491,7 @@ std::string robot_command_thread::ConveyorCatchPointComp(std::string para){
 /**
  * @brief 直线运动
  * @param [in] status 状态，1-启动，0-停止
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::TrackMoveL(std::string para){
     std::list<std::string> list;
@@ -6460,7 +6515,7 @@ std::string robot_command_thread::TrackMoveL(std::string para){
 /**
  * @brief 获取SSH公钥
  * @param [out] keygen 公钥
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetSSHKeygen(std::string para){
     char keygen[1024];
@@ -6475,7 +6530,7 @@ std::string robot_command_thread::GetSSHKeygen(std::string para){
  * @param [in] sship 上位机ip地址
  * @param [in] usr_file_url 上位机文件路径
  * @param [in] robot_file_url 机器人控制器文件路径
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetSSHScpCmd(std::string para){
     std::list<std::string> list;
@@ -6499,7 +6554,7 @@ std::string robot_command_thread::SetSSHScpCmd(std::string para){
  * @brief 计算指定路径下文件的MD5值
  * @param [in] file_path 文件路径包含文件名，默认Traj文件夹路径为:"/fruser/traj/",如"/fruser/traj/trajHelix_aima_1.txt"
  * @param [out] md5 文件MD5值
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ComputeFileMD5(std::string para){
     std::list<std::string> list;
@@ -6517,7 +6572,7 @@ std::string robot_command_thread::ComputeFileMD5(std::string para){
 /**
  * @brief 获取机器人急停状态
  * @param [out] state 急停状态，0-非急停，1-急停
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetRobotEmergencyStopState(std::string para){
     uint8_t state;
@@ -6529,7 +6584,7 @@ std::string robot_command_thread::GetRobotEmergencyStopState(std::string para){
 /**
  * @brief 获取SDK与机器人的通讯状态
  * @param [out]  state 通讯状态，0-通讯正常，1-通讯异常
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetSDKComState(std::string para){
     int state;
@@ -6542,7 +6597,7 @@ std::string robot_command_thread::GetSDKComState(std::string para){
  * @brief 获取安全停止信号
  * @param [out]  si0_state 安全停止信号SI0
  * @param [out]  si1_state 安全停止信号SI1
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetSafetyStopState(std::string para){
     uint8_t si0_state;
@@ -6563,7 +6618,7 @@ std::string robot_command_thread::GetSafetyStopState(std::string para){
  * @param[out] driver5version 驱动器5硬件版本
  * @param[out] driver6version 驱动器6硬件版本
  * @param[out] endBoardversion 未端版硬件版本
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetHardwareVersion(std::string para){
     char ctrlBoxBoardversion[128];
@@ -6593,7 +6648,7 @@ std::string robot_command_thread::GetHardwareVersion(std::string para){
  * @param[out] driver5version 驱动器5固件版本
  * @param[out] driver6version 驱动器6固件版本
  * @param[out] endBoardversion 未端版固件版本
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetFirmwareVersion(std::string para){
     char ctrlBoxBoardversion[128];
@@ -6617,7 +6672,7 @@ std::string robot_command_thread::GetFirmwareVersion(std::string para){
 /**
  * @brief 点位表切换
  * @param [in] pointTableName 要切换的点位表名称    pointTable1.db
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::PointTableSwitch(std::string para){
     std::list<std::string> list;
@@ -6633,7 +6688,7 @@ std::string robot_command_thread::PointTableSwitch(std::string para){
  * @brief 下载点位表数据库
  * @param [in] pointTableName 要下载的点位表名称    pointTable1.db
  * @param [in] saveFilePath 下载点位表的存储路径   C://test/
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::PointTableDownLoad(std::string para){
     std::list<std::string> list;
@@ -6649,7 +6704,7 @@ std::string robot_command_thread::PointTableDownLoad(std::string para){
 /**
  * @brief 上传点位表数据库
  * @param [in] pointTableFilePath 上传点位表的全路径名   C://test/pointTable1.db
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::PointTableUpLoad(std::string para){
     std::list<std::string> list;
@@ -6666,7 +6721,7 @@ std::string robot_command_thread::PointTableUpLoad(std::string para){
  * @param [in] pointTableName 要切换的点位表名称   "pointTable1.db",当点位表为空，即""时，表示将lua程序更新为未应用点位表的初始程
  * @param [in] luaFileName 要更新的lua文件名称   "testPointTable.lua"
  * @param [out] errorStr 切换点位表错误信息
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::PointTableUpdateLua(std::string para){
     std::list<std::string> list;
@@ -6695,7 +6750,7 @@ std::string robot_command_thread::PointTableUpdateLua(std::string para){
  * @param [in] weaveStationary 摆动位置等待，0-等待时间内位置继续移动；1-等待时间内位置静止
  * @param [in] weaveYawAngle 摆动方向方位角(绕摆动Z轴旋转)，单位°
  * @param [in] weaveRotAngle 摆动方向侧倾角(绕摆动X轴偏转)，单位°
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::WeaveSetPara(std::string para){
     std::list<std::string> list;
@@ -6733,7 +6788,7 @@ std::string robot_command_thread::WeaveSetPara(std::string para){
  * @param [in] weaveRightStayTime 摆动右停留时间(ms)
  * @param [in] weaveCircleRadio 圆形摆动-回调比率(0-100%)
  * @param [in] weaveStationary 摆动位置等待，0-等待时间内位置继续移动；1-等待时间内位置静止
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::WeaveOnlineSetPara(std::string para){
     std::list<std::string> list;
@@ -6757,7 +6812,7 @@ std::string robot_command_thread::WeaveOnlineSetPara(std::string para){
 /**
  * @brief 摆动开始
  * @param [in] weaveNum 摆焊参数配置编号
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::WeaveStart(std::string para){
     std::list<std::string> list;
@@ -6772,7 +6827,7 @@ std::string robot_command_thread::WeaveStart(std::string para){
 /**
  * @brief 摆动结束
  * @param [in] weaveNum 摆焊参数配置编号
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::WeaveEnd(std::string para){
     std::list<std::string> list;
@@ -6854,7 +6909,7 @@ std::string robot_command_thread::SegmentWeldStart(std::string para){
  * @param output_model：输出模式，0-直接输出；1-缓冲输出；2-异步输出;
  * @param file_path: 文件保存路径+名称，,长度上限256，名称必须是xxx.log的形式，比如/home/fr/linux/fairino.log;
  * @param file_num：滚动存储的文件数量，1~20个.单个文件上限50M;
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::LoggerInit(std::string para){
     std::list<std::string> list;
@@ -6871,7 +6926,7 @@ std::string robot_command_thread::LoggerInit(std::string para){
 /**
  * @brief 设置日志过滤等级;
  * @param lvl: 过滤等级值，值越小输出日志越少，默认值是1. 1-error, 2-warnning, 3-inform, 4-debug;
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetLoggerLevel(std::string para){
     std::list<std::string> list;
@@ -6891,7 +6946,7 @@ std::string robot_command_thread::SetLoggerLevel(std::string para){
  * @param [out] servoState 伺服驱动器状态[十进制数转为二进制，bit0-bit5：伺服使能-伺服运行-正限位触发-负限位触发-定位完成-回零完成]
  * @param [out] servoPos 伺服当前位置 mm或°
  * @param [out] servoSpeed 伺服当前速度 mm/s或°/s
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::AuxServoGetStatus(std::string para){
     std::list<std::string> list;
@@ -6914,7 +6969,7 @@ std::string robot_command_thread::AuxServoGetStatus(std::string para){
 /**
  * @brief 设置机器人加速度
  * @param [in] acc 机器人加速度百分比
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetOaccScale(std::string para){
     std::list<std::string> list;
@@ -6932,7 +6987,7 @@ std::string robot_command_thread::SetOaccScale(std::string para){
  * @param [in] maxTCPSpeed 最大TCP速度值[1-5000mm/s]，默认1000
  * @param [in] maxAOPercent 最大TCP速度值对应的AO百分比，默认100%
  * @param [in] zeroZoneCmp 死区补偿值AO百分比，整形，默认为20%，范围[0-100]
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::MoveAOStart(std::string para){
     std::list<std::string> list;
@@ -6949,7 +7004,7 @@ std::string robot_command_thread::MoveAOStart(std::string para){
 
 /**
  * @brief 控制箱AO飞拍停止
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::MoveAOStop(std::string para){
     int res = _ptr_robot->MoveAOStop();
@@ -6962,7 +7017,7 @@ std::string robot_command_thread::MoveAOStop(std::string para){
  * @param [in] maxTCPSpeed 最大TCP速度值[1-5000mm/s]，默认1000
  * @param [in] maxAOPercent 最大TCP速度值对应的AO百分比，默认100%
  * @param [in] zeroZoneCmp 死区补偿值AO百分比，整形，默认为20%，范围[0-100]
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::MoveToolAOStart(std::string para){
     std::list<std::string> list;
@@ -6979,7 +7034,7 @@ std::string robot_command_thread::MoveToolAOStart(std::string para){
 
 /**
  * @brief 末端AO飞拍停止
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::MoveToolAOStop(std::string para){
     int res = _ptr_robot->MoveToolAOStop();
@@ -6988,7 +7043,7 @@ std::string robot_command_thread::MoveToolAOStop(std::string para){
 
 /**
  * @brief 卸载UDP通信
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::ExtDevUnloadUDPDriver(std::string para){
     int res = _ptr_robot->ExtDevUnloadUDPDriver();
@@ -6998,7 +7053,7 @@ std::string robot_command_thread::ExtDevUnloadUDPDriver(std::string para){
 /**
  * @brief 设置扩展DI输入滤波时间
  * @param [in] filterTime 滤波时间(ms)
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetAuxDIFilterTime(std::string para){
     std::list<std::string> list;
@@ -7014,7 +7069,7 @@ std::string robot_command_thread::SetAuxDIFilterTime(std::string para){
  * @brief 设置扩展AI输入滤波时间
  * @param [in] AONum AO编号
  * @param [in] filterTime 滤波时间(ms)
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetAuxAIFilterTime(std::string para){
     std::list<std::string> list;
@@ -7033,7 +7088,7 @@ std::string robot_command_thread::SetAuxAIFilterTime(std::string para){
  * @param [in] bOpen 开关 0-关；1-开
  * @param [in] time 最大等待时间(ms)
  * @param [in] errorAlarm 是否继续运动
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::WaitAuxDI(std::string para){
     std::list<std::string> list;
@@ -7055,7 +7110,7 @@ std::string robot_command_thread::WaitAuxDI(std::string para){
  * @param [in] value AI值
  * @param [in] time 最大等待时间(ms)
  * @param [in] errorAlarm 是否继续运动
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::WaitAuxAI(std::string para){
     std::list<std::string> list;
@@ -7076,7 +7131,7 @@ std::string robot_command_thread::WaitAuxAI(std::string para){
  * @param [in] DINum DI编号
  * @param [in] isNoBlock 是否阻塞
  * @param [out] isOpen 0-关；1-开
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetAuxDI(std::string para){
     std::list<std::string> list;
@@ -7099,7 +7154,7 @@ std::string robot_command_thread::GetAuxDI(std::string para){
  * @param [in] DINum DI编号
  * @param [in] isNoBlock 是否阻塞
  * @param [out] isOpen 0-关；1-开
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::GetAuxAI(std::string para){
     std::list<std::string> list;
@@ -7117,7 +7172,7 @@ std::string robot_command_thread::GetAuxAI(std::string para){
 /**
  * @brief 设置标定参考点在变位机末端坐标系下位姿
  * @param [in] pos 位姿值
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::SetRefPointInExAxisEnd(std::string para){
     std::list<std::string> list;
@@ -7133,7 +7188,7 @@ std::string robot_command_thread::SetRefPointInExAxisEnd(std::string para){
 /**
  * @brief 变位机坐标系参考点设置
  * @param [in]  pointNum 点编号[1-4]
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::PositionorSetRefPoint(std::string para){
     std::list<std::string> list;
@@ -7148,7 +7203,7 @@ std::string robot_command_thread::PositionorSetRefPoint(std::string para){
 /**
  * @brief 变位机坐标系计算-四点法
  * @param [out]  coord 坐标系值
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::PositionorComputeECoordSys(std::string para){
     DescPose coord;
@@ -8116,7 +8171,7 @@ std::string robot_command_thread::ArcWeldTraceReplayEnd(std::string para){
  * @param  [in] dz z方向偏移量(mm)
  * @param  [in] dry 绕y轴偏移量(°)
  * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码 
+ * @retval 0-成功，其他-错误码
  */
 std::string robot_command_thread::MultilayerOffsetTrsfToBase(std::string para){
     std::list<std::string> list;
@@ -8139,7 +8194,7 @@ std::string robot_command_thread::MultilayerOffsetTrsfToBase(std::string para){
     double db = std::stod(list.front().c_str());list.pop_front();
 
     DescPose offset;
-    
+
     int res = _ptr_robot->MultilayerOffsetTrsfToBase(pointO, pointX, pointZ, dx, dy, db, offset);
     return std::string(std::to_string(res) + "," + std::to_string(offset.tran.x) + "," + \
             std::to_string(offset.tran.y) + "," + std::to_string(offset.tran.z) + "," + \
@@ -8225,10 +8280,10 @@ std::string robot_command_thread::SetAxleCommunicationParam(std::string para){
 
     AxleComParam param;
     param.baudRate = std::stoi(list.front());list.pop_front();
-	param.dataBit = std::stoi(list.front());list.pop_front(); 
-	param.stopBit = std::stoi(list.front());list.pop_front(); 
-	param.verify = std::stoi(list.front());list.pop_front();  
-	param.timeout = std::stoi(list.front());list.pop_front(); 
+	param.dataBit = std::stoi(list.front());list.pop_front();
+	param.stopBit = std::stoi(list.front());list.pop_front();
+	param.verify = std::stoi(list.front());list.pop_front();
+	param.timeout = std::stoi(list.front());list.pop_front();
 	param.timeoutTimes = std::stoi(list.front());list.pop_front();
 	param.period = std::stoi(list.front());list.pop_front();
 
@@ -8373,7 +8428,7 @@ std::string robot_command_thread::SetAxleLuaGripperFunc(std::string para){
     for(int i = 0; i < len;i++){
         func[i] = std::stoi(list.front());list.pop_front();
     }
-    
+
     int res = _ptr_robot->SetAxleLuaGripperFunc(id,func);
     return std::string(std::to_string(res));
 }
@@ -8390,7 +8445,7 @@ std::string robot_command_thread::GetAxleLuaGripperFunc(std::string para){
 
     int id = std::stoi(list.front());list.pop_front();
     int func[16];
-    
+
     int res = _ptr_robot->GetAxleLuaGripperFunc(id,func);
     return std::string(std::to_string(res) + "," + std::to_string(func[0]) + "," + \
             std::to_string(func[1]) + "," + std::to_string(func[2]) + "," + \
@@ -8414,7 +8469,7 @@ std::string robot_command_thread::SetCtrlOpenLuaErrCode(std::string para){
 
     int id = std::stoi(list.front());list.pop_front();
     int code = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->SetCtrlOpenLuaErrCode(id,code);
     return std::string(std::to_string(res));
 }
@@ -8433,7 +8488,7 @@ std::string robot_command_thread::SlaveFileWrite(std::string para){
     int type = std::stoi(list.front());list.pop_front();
     int slaveID = std::stoi(list.front());list.pop_front();
     std::string fileName = list.front();list.pop_front();
-    
+
     int res = _ptr_robot->SlaveFileWrite(type,slaveID,fileName);
     return std::string(std::to_string(res));
 }
@@ -8448,7 +8503,7 @@ std::string robot_command_thread::AxleLuaUpload(std::string para){
     _splitString2List(para,list);
 
     std::string filePath = list.front();list.pop_front();
-    
+
     int res = _ptr_robot->AxleLuaUpload(filePath);
     return std::string(std::to_string(res));
 }
@@ -8472,7 +8527,7 @@ std::string robot_command_thread::SetWeldMachineCtrlModeExtDoNum(std::string par
     _splitString2List(para,list);
 
     int DONum = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->SetWeldMachineCtrlModeExtDoNum(DONum);
     return std::string(std::to_string(res));
 }
@@ -8489,7 +8544,7 @@ std::string robot_command_thread::SetWeldMachineCtrlMode(std::string para){
 
     int mode = std::stoi(list.front());list.pop_front();
     int ioType = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->SetWeldMachineCtrlMode(mode,ioType);
     return std::string(std::to_string(res));
 }
@@ -8509,7 +8564,7 @@ std::string robot_command_thread::SingularAvoidStart(std::string para){
     int minShoulderPos = std::stoi(list.front());list.pop_front();
     int minElbowPos = std::stoi(list.front());list.pop_front();
     int minWristPos = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->SingularAvoidStart(protectMode,minShoulderPos,minElbowPos,minWristPos);
     return std::string(std::to_string(res));
 }
@@ -8535,7 +8590,7 @@ std::string robot_command_thread::PtpFIRPlanningStart(std::string para){
 
     double maxAcc = std::stod(list.front());list.pop_front();
     double maxJek = std::stod(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->PtpFIRPlanningStart(maxAcc,maxJek);
     return std::string(std::to_string(res));
 }
@@ -8565,7 +8620,7 @@ std::string robot_command_thread::LinArcFIRPlanningStart(std::string para){
     double maxAccDeg = std::stod(list.front());list.pop_front();
     double maxJerkLin = std::stod(list.front());list.pop_front();
     double maxJerkDeg = std::stod(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->LinArcFIRPlanningStart(maxAccLin,maxAccDeg,maxJerkLin,maxJerkDeg);
     return std::string(std::to_string(res));
 }
@@ -8608,7 +8663,7 @@ std::string robot_command_thread::LaserSensorRecord(std::string para){
     int triggerMode = std::stoi(list.front());list.pop_front();
     int runTime = std::stoi(list.front());list.pop_front();
     double speed = std::stod(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->LaserSensorRecord(status, delayMode, delayTime, delayDisExAxisNum, delayDis, sensitivePara, trackMode, triggerMode, runTime, speed);
     return std::string(std::to_string(res));
 }
@@ -8618,7 +8673,7 @@ std::string robot_command_thread::LaserTrackingLaserOn(std::string para){
     _splitString2List(para,list);
 
     int weldId = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->LaserTrackingLaserOn(weldId);
     return std::string(std::to_string(res));
 }
@@ -8633,7 +8688,7 @@ std::string robot_command_thread::LaserTrackingTrackOn(std::string para){
     _splitString2List(para,list);
 
     int coordId = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->LaserTrackingTrackOn(coordId);
     return std::string(std::to_string(res));
 }
@@ -8656,7 +8711,7 @@ std::string robot_command_thread::LaserTrackingSearchStart(std::string para){
     int distance = std::stoi(list.front());list.pop_front();
     int timeout = std::stoi(list.front());list.pop_front();
     int posSensorNum = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->LaserTrackingSearchStart(direction, directionPoint, vel, distance, timeout, posSensorNum);
     return std::string(std::to_string(res));
 }
@@ -8673,7 +8728,7 @@ std::string robot_command_thread::LaserTrackingLaserOnOff(std::string para){
 
     int OnOff = std::stoi(list.front());list.pop_front();
     int weldId = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->LaserTrackingLaserOnOff(OnOff,weldId);
     return std::string(std::to_string(res));
 }
@@ -8690,7 +8745,7 @@ std::string robot_command_thread::LaserTrackingTrackOnOff(std::string para){
 
     int OnOff = std::stoi(list.front());list.pop_front();
     int coordId = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->LaserTrackingTrackOnOff(OnOff,coordId);
     return std::string(std::to_string(res));
 }
@@ -8713,7 +8768,7 @@ std::string robot_command_thread::LaserTrackingSearchStart_xyz(std::string para)
     int distance = std::stoi(list.front());list.pop_front();
     int timeout = std::stoi(list.front());list.pop_front();
     int posSensorNum = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->LaserTrackingSearchStart_xyz(direction,vel,distance,timeout,posSensorNum);
     return std::string(std::to_string(res));
 }
@@ -8739,7 +8794,7 @@ std::string robot_command_thread::LaserTrackingSearchStart_point(std::string par
     int distance = std::stoi(list.front());list.pop_front();
     int timeout = std::stoi(list.front());list.pop_front();
     int posSensorNum = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->LaserTrackingSearchStart_point(direction,vel,distance,timeout,posSensorNum);
     return std::string(std::to_string(res));
 }
@@ -8768,7 +8823,7 @@ std::string robot_command_thread::LaserTrackingSensorConfig(std::string para){
 
     std::string ip = list.front();list.pop_front();
     int port = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->LaserTrackingSensorConfig(ip,port);
     return std::string(std::to_string(res));
 }
@@ -8783,7 +8838,7 @@ std::string robot_command_thread::LaserTrackingSensorSamplePeriod(std::string pa
     _splitString2List(para,list);
 
     int period = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->LaserTrackingSensorSamplePeriod(period);
     return std::string(std::to_string(res));
 }
@@ -8798,7 +8853,7 @@ std::string robot_command_thread::LoadPosSensorDriver(std::string para){
     _splitString2List(para,list);
 
     int type = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->LoadPosSensorDriver(type);
     return std::string(std::to_string(res));
 }
@@ -8824,7 +8879,7 @@ std::string robot_command_thread::LaserSensorRecord1(std::string para){
 
     int status = std::stoi(list.front());list.pop_front();
     int delayTime = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->LaserSensorRecord1(status,delayTime);
     return std::string(std::to_string(res));
 }
@@ -8841,7 +8896,7 @@ std::string robot_command_thread::LaserSensorReplay(std::string para){
 
     int delayTime = std::stoi(list.front());list.pop_front();
     double speed = std::stod(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->LaserSensorReplay(delayTime,speed);
     return std::string(std::to_string(res));
 }
@@ -8881,7 +8936,7 @@ std::string robot_command_thread::LaserSensorRecordandReplay(std::string para){
     int triggerMode = std::stoi(list.front());list.pop_front();
     double runTime = std::stod(list.front());list.pop_front();
     double speed = std::stod(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->LaserSensorRecordandReplay(delayMode, delayTime, delayDisExAxisNum, delayDis, sensitivePara, trackMode, triggerMode, runTime, speed);
     return std::string(std::to_string(res));
 }
@@ -8898,7 +8953,7 @@ std::string robot_command_thread::MoveToLaserRecordStart(std::string para){
 
     int moveType = std::stoi(list.front());list.pop_front();
     double ovl = std::stod(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->MoveToLaserRecordStart(moveType,ovl);
     return std::string(std::to_string(res));
 }
@@ -8915,7 +8970,7 @@ std::string robot_command_thread::MoveToLaserRecordEnd(std::string para){
 
     int moveType = std::stoi(list.front());list.pop_front();
     double ovl = std::stod(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->MoveToLaserRecordEnd(moveType,ovl);
     return std::string(std::to_string(res));
 }
@@ -8941,7 +8996,7 @@ std::string robot_command_thread::MoveToLaserSeamPos(std::string para){
     int trackOffectType = std::stoi(list.front());list.pop_front();
     DescPose offset;
     _fillDescPose(list,offset);
-    
+
     int res = _ptr_robot->MoveToLaserSeamPos(moveFlag,ovl,dataFlag,plateType,trackOffectType,offset);
     return std::string(std::to_string(res));
 }
@@ -8970,7 +9025,7 @@ std::string robot_command_thread::GetLaserSeamPos(std::string para){
     int tool;
     int user;
     ExaxisPos exaxis;
-    
+
     int res = _ptr_robot->GetLaserSeamPos(trackOffectType,offset,jPos,descPos,tool,user,exaxis);
     return std::string(std::to_string(res) + "," + std::to_string(jPos.jPos[0]) + "," +\
             std::to_string(jPos.jPos[1]) + "," + std::to_string(jPos.jPos[2]) + "," +\
@@ -8987,7 +9042,7 @@ std::string robot_command_thread::GetLaserSeamPos(std::string para){
 /**
  * @brief 摆动渐变开始
  * @param [in] weaveChangeFlag 1-变摆动参数；2-变摆动参数+焊接速度
- * @param [in] weaveNum 摆动编号 
+ * @param [in] weaveNum 摆动编号
  * @param [in] velStart 焊接开始速度，(cm/min)
  * @param [in] velEnd 焊接结束速度，(cm/min)
  * @return 错误码
@@ -9000,7 +9055,7 @@ std::string robot_command_thread::WeaveChangeStart(std::string para){
     int weaveNum = std::stoi(list.front());list.pop_front();
     double velStart = std::stod(list.front());list.pop_front();
     double velEnd = std::stod(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->WeaveChangeStart(weaveChangeFlag,weaveNum,velStart,velEnd);
     return std::string(std::to_string(res));
 }
@@ -9041,7 +9096,7 @@ std::string robot_command_thread::LoadTrajectoryLA(std::string para){
     double amax = std::stod(list.front());list.pop_front();
     double jmax = std::stod(list.front());list.pop_front();
     int flag = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->LoadTrajectoryLA(name, mode, errorLim, type, precision, vamx, amax, jmax, flag);
     return std::string(std::to_string(res));
 }
@@ -9083,7 +9138,7 @@ std::string robot_command_thread::CustomCollisionDetectionStart(std::string para
     tcpDetectionThreshould[4] = std::stod(list.front());list.pop_front();
     tcpDetectionThreshould[5] = std::stod(list.front());list.pop_front();
     int block = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->CustomCollisionDetectionStart(flag, jointDetectionThreshould, tcpDetectionThreshould, block);
     return std::string(std::to_string(res));
 }
@@ -9107,7 +9162,7 @@ std::string robot_command_thread::AccSmoothStart(std::string para){
     _splitString2List(para,list);
 
     int saveFlag = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->AccSmoothStart(saveFlag);
     return std::string(std::to_string(res));
 }
@@ -9122,7 +9177,7 @@ std::string robot_command_thread::AccSmoothEnd(std::string para){
     _splitString2List(para,list);
 
     int saveFlag = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->AccSmoothEnd(saveFlag);
     return std::string(std::to_string(res));
 }
@@ -9137,7 +9192,7 @@ std::string robot_command_thread::RbLogDownload(std::string para){
     _splitString2List(para,list);
 
     std::string savePath = list.front();list.pop_front();
-    
+
     int res = _ptr_robot->RbLogDownload(savePath);
     return std::string(std::to_string(res));
 }
@@ -9152,7 +9207,7 @@ std::string robot_command_thread::AllDataSourceDownload(std::string para){
     _splitString2List(para,list);
 
     std::string savePath = list.front();list.pop_front();
-    
+
     int res = _ptr_robot->AllDataSourceDownload(savePath);
     return std::string(std::to_string(res));
 }
@@ -9167,7 +9222,7 @@ std::string robot_command_thread::DataPackageDownload(std::string para){
     _splitString2List(para,list);
 
     std::string savePath = list.front();list.pop_front();
-    
+
     int res = _ptr_robot->DataPackageDownload(savePath);
     return std::string(std::to_string(res));
 }
@@ -9179,7 +9234,7 @@ std::string robot_command_thread::DataPackageDownload(std::string para){
  */
 std::string robot_command_thread::GetRobotSN(std::string para){
     std::string SNCode;
-    
+
     int res = _ptr_robot->GetRobotSN(SNCode);
     return std::string(std::to_string(res) + "," + std::string(SNCode));
 }
@@ -9203,7 +9258,7 @@ std::string robot_command_thread::ConveyorComDetect(std::string para){
     _splitString2List(para,list);
 
     int timeout = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->ConveyorComDetect(timeout);
     return std::string(std::to_string(res));
 }
@@ -9235,7 +9290,7 @@ std::string robot_command_thread::WeldingSetVoltageGradualChangeStart(std::strin
     double voltageEnd = std::stod(list.front());list.pop_front();
     int AOIndex = std::stoi(list.front());list.pop_front();
     int blend = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->WeldingSetVoltageGradualChangeStart(IOType, voltageStart, voltageEnd, AOIndex,blend);
     return std::string(std::to_string(res));
 }
@@ -9267,7 +9322,7 @@ std::string robot_command_thread::WeldingSetCurrentGradualChangeStart(std::strin
     double currentEnd = std::stod(list.front());list.pop_front();
     int AOIndex = std::stoi(list.front());list.pop_front();
     int blend = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->WeldingSetCurrentGradualChangeStart(IOType, currentStart, currentEnd, AOIndex,blend);
     return std::string(std::to_string(res));
 }
@@ -9289,7 +9344,7 @@ std::string robot_command_thread::WeldingSetCurrentGradualChangeEnd(std::string 
  */
 std::string robot_command_thread::GetSmarttoolBtnState(std::string para){
     int state;
-    
+
     int res = _ptr_robot->GetSmarttoolBtnState(state);
     return std::string(std::to_string(res) + "," + std::to_string(state));
 }
@@ -9306,7 +9361,7 @@ std::string robot_command_thread::SetWideBoxTempFanMonitorParam(std::string para
 
     int enable = std::stoi(list.front());list.pop_front();
     int period = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->SetWideBoxTempFanMonitorParam(enable,period);
     return std::string(std::to_string(res));
 }
@@ -9320,7 +9375,7 @@ std::string robot_command_thread::SetWideBoxTempFanMonitorParam(std::string para
 std::string robot_command_thread::GetWideBoxTempFanMonitorParam(std::string para){
     int enable;
     int period;
-    
+
     int res = _ptr_robot->GetWideBoxTempFanMonitorParam(enable,period);
     return std::string(std::to_string(res) + "," + std::to_string(enable) + "," +\
             std::to_string(period));
@@ -9339,7 +9394,7 @@ std::string robot_command_thread::SetFocusCalibPoint(std::string para){
     int pointNum = std::stoi(list.front());list.pop_front();
     DescPose point;
     _fillDescPose(list,point);
-    
+
     int res = _ptr_robot->SetFocusCalibPoint(pointNum,point);
     return std::string(std::to_string(res));
 }
@@ -9539,7 +9594,7 @@ std::string robot_command_thread::LaserRecordPoint(std::string para){
             std::to_string(joint.jPos[3]) + "," + std::to_string(joint.jPos[4]) + "," +\
             std::to_string(joint.jPos[5]) + "," + std::to_string(exaxis.ePos[0]) + "," +\
             std::to_string(exaxis.ePos[1]) + "," + std::to_string(exaxis.ePos[2]) + "," +\
-            std::to_string(exaxis.ePos[3]));            
+            std::to_string(exaxis.ePos[3]));
 }
 
 /**
@@ -9591,7 +9646,7 @@ std::string robot_command_thread::GetFieldBusConfig(std::string para){
 
     int res = _ptr_robot->GetFieldBusConfig(&type,&version,&connState);
     return std::string(std::to_string(res) + ","  + std::to_string(type) + "," + \
-            std::to_string(version) + "," + std::to_string(connState));            
+            std::to_string(version) + "," + std::to_string(connState));
 }
 
 /**
@@ -9608,7 +9663,7 @@ std::string robot_command_thread::FieldBusSlaveWriteDO(std::string para){
     uint8_t DOIndex = std::stoi(list.front());list.pop_front();
     uint8_t wirteNum = std::stoi(list.front());list.pop_front();
 
-    uint8_t status[8]; 
+    uint8_t status[8];
     status[0] = std::stoi(list.front());list.pop_front();
     status[1] = std::stoi(list.front());list.pop_front();
     status[2] = std::stoi(list.front());list.pop_front();
@@ -9619,7 +9674,7 @@ std::string robot_command_thread::FieldBusSlaveWriteDO(std::string para){
     status[7] = std::stoi(list.front());list.pop_front();
 
     int res = _ptr_robot->FieldBusSlaveWriteDO(DOIndex,wirteNum,status);
-    return std::string(std::to_string(res));            
+    return std::string(std::to_string(res));
 }
 
 /**
@@ -9636,7 +9691,7 @@ std::string robot_command_thread::FieldBusSlaveWriteAO(std::string para){
     uint8_t AOIndex = std::stoi(list.front());list.pop_front();
     uint8_t wirteNum = std::stoi(list.front());list.pop_front();
 
-    double status[8]; 
+    double status[8];
     status[0] = std::stod(list.front());list.pop_front();
     status[1] = std::stod(list.front());list.pop_front();
     status[2] = std::stod(list.front());list.pop_front();
@@ -9647,7 +9702,7 @@ std::string robot_command_thread::FieldBusSlaveWriteAO(std::string para){
     status[7] = std::stod(list.front());list.pop_front();
 
     int res = _ptr_robot->FieldBusSlaveWriteAO(AOIndex,wirteNum,status);
-    return std::string(std::to_string(res));            
+    return std::string(std::to_string(res));
 }
 
 /**
@@ -9664,14 +9719,14 @@ std::string robot_command_thread::FieldBusSlaveReadDI(std::string para){
     uint8_t DOIndex = std::stoi(list.front());list.pop_front();
     uint8_t readNum = std::stoi(list.front());list.pop_front();
 
-    uint8_t status[8]; 
+    uint8_t status[8];
 
     int res = _ptr_robot->FieldBusSlaveReadDI(DOIndex,readNum,status);
     return std::string(std::to_string(res) + ","  + std::to_string(status[0]) + "," +\
         std::to_string(status[1]) + "," + std::to_string(status[2]) + "," +\
         std::to_string(status[3]) + "," + std::to_string(status[4]) + "," +\
         std::to_string(status[5]) + "," + std::to_string(status[6]) + "," +\
-        std::to_string(status[7]));             
+        std::to_string(status[7]));
 }
 
 /**
@@ -9688,14 +9743,14 @@ std::string robot_command_thread::FieldBusSlaveReadAI(std::string para){
     uint8_t AIIndex = std::stoi(list.front());list.pop_front();
     uint8_t readNum = std::stoi(list.front());list.pop_front();
 
-    double status[8]; 
+    double status[8];
 
     int res = _ptr_robot->FieldBusSlaveReadAI(AIIndex,readNum,status);
     return std::string(std::to_string(res) + ","  + std::to_string(status[0]) + "," +\
         std::to_string(status[1]) + "," + std::to_string(status[2]) + "," +\
         std::to_string(status[3]) + "," + std::to_string(status[4]) + "," +\
         std::to_string(status[5]) + "," + std::to_string(status[6]) + "," +\
-        std::to_string(status[7]));             
+        std::to_string(status[7]));
 }
 
 /**
@@ -9714,7 +9769,7 @@ std::string robot_command_thread::FieldBusSlaveWaitDI(std::string para){
     int waitMs = std::stoi(list.front());list.pop_front();
 
     int res = _ptr_robot->FieldBusSlaveWaitDI(DIIndex,status,waitMs);
-    return std::string(std::to_string(res));            
+    return std::string(std::to_string(res));
 }
 
 /**
@@ -9735,7 +9790,7 @@ std::string robot_command_thread::FieldBusSlaveWaitAI(std::string para){
     int waitMs = std::stoi(list.front());list.pop_front();
 
     int res = _ptr_robot->FieldBusSlaveWaitAI(AIIndex,waitType,value,waitMs);
-    return std::string(std::to_string(res));            
+    return std::string(std::to_string(res));
 }
 
 /**
@@ -9775,14 +9830,14 @@ std::string robot_command_thread::SetSuckerCtrl(std::string para){
     ctrlValue[19] = std::stoi(list.front());list.pop_front();
 
     int res = _ptr_robot->SetSuckerCtrl(slaveID,len,ctrlValue);
-    return std::string(std::to_string(res));            
+    return std::string(std::to_string(res));
 }
 
 /**
  * @brief 获取阵列式吸盘状态
  * @param [in] slaveID 从站号
  * @param [out] state 吸附状态 0-释放物体 1-检测到工件吸附成功 2-没有吸附到物体 3-物体脱离
- * @param [out] pressValue 当前真空度 单位kpa 
+ * @param [out] pressValue 当前真空度 单位kpa
  * @param [out] error 吸盘当前的错误码
  * @return 错误码
  */
@@ -9798,7 +9853,7 @@ std::string robot_command_thread::GetSuckerState(std::string para){
 
     int res = _ptr_robot->GetSuckerState(slaveID,&state,&pressValue,&error);
     return std::string(std::to_string(res) + ","  + std::to_string(state) + "," +\
-        std::to_string(pressValue) + "," + std::to_string(error));          
+        std::to_string(pressValue) + "," + std::to_string(error));
 }
 
 /**
@@ -9817,7 +9872,7 @@ std::string robot_command_thread::WaitSuckerState(std::string para){
     int ms = std::stoi(list.front());list.pop_front();
 
     int res = _ptr_robot->WaitSuckerState(slaveID,state,ms);
-    return std::string(std::to_string(res));            
+    return std::string(std::to_string(res));
 }
 
 
@@ -9841,7 +9896,7 @@ std::string robot_command_thread::ImpedanceControlStartStop(std::string para){
 
     int status = std::stoi(list.front());list.pop_front();
     int workSpace = std::stoi(list.front());list.pop_front();
-    
+
     double forceThreshold[6];
     forceThreshold[0] = std::stod(list.front());list.pop_front();
     forceThreshold[1] = std::stod(list.front());list.pop_front();
@@ -9870,14 +9925,14 @@ std::string robot_command_thread::ImpedanceControlStartStop(std::string para){
     k[3] = std::stod(list.front());list.pop_front();
     k[4] = std::stod(list.front());list.pop_front();
     k[5] = std::stod(list.front());list.pop_front();
-    
+
     double maxV = std::stod(list.front());list.pop_front();
     double maxVA = std::stod(list.front());list.pop_front();
     double maxW = std::stod(list.front());list.pop_front();
     double maxWA = std::stod(list.front());list.pop_front();
 
     int res = _ptr_robot->ImpedanceControlStartStop(status,workSpace,forceThreshold,m,b,k,maxV,maxVA,maxW,maxWA);
-    return std::string(std::to_string(res));            
+    return std::string(std::to_string(res));
 }
 
 /**
@@ -9890,9 +9945,9 @@ std::string robot_command_thread::SetTorqueDetectionSwitch(std::string para){
     _splitString2List(para,list);
 
     uint8_t flag = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->SetTorqueDetectionSwitch(flag);
-    return std::string(std::to_string(res));            
+    return std::string(std::to_string(res));
 }
 
 /**
@@ -9912,8 +9967,8 @@ std::string robot_command_thread::GetToolCoordWithID(std::string para){
     return std::string(std::to_string(res) + ","  + std::to_string(coord.tran.x) + "," + \
             std::to_string(coord.tran.y) + "," + std::to_string(coord.tran.z) + "," + \
             std::to_string(coord.rpy.rx) + "," + std::to_string(coord.rpy.ry) + "," + \
-            std::to_string(coord.rpy.rz));            
-}  
+            std::to_string(coord.rpy.rz));
+}
 
 /**
 * @brief 根据编号获取工件坐标系
@@ -9932,8 +9987,8 @@ std::string robot_command_thread::GetWObjCoordWithID(std::string para){
     return std::string(std::to_string(res) + ","  + std::to_string(coord.tran.x) + "," + \
             std::to_string(coord.tran.y) + "," + std::to_string(coord.tran.z) + "," + \
             std::to_string(coord.rpy.rx) + "," + std::to_string(coord.rpy.ry) + "," + \
-            std::to_string(coord.rpy.rz));            
-}  
+            std::to_string(coord.rpy.rz));
+}
 
 /**
 * @brief 根据编号获取外部工具坐标系
@@ -9952,8 +10007,8 @@ std::string robot_command_thread::GetExToolCoordWithID(std::string para){
     return std::string(std::to_string(res) + ","  + std::to_string(coord.tran.x) + "," + \
             std::to_string(coord.tran.y) + "," + std::to_string(coord.tran.z) + "," + \
             std::to_string(coord.rpy.rx) + "," + std::to_string(coord.rpy.ry) + "," + \
-            std::to_string(coord.rpy.rz));            
-} 
+            std::to_string(coord.rpy.rz));
+}
 
 /**
 * @brief 根据编号获取扩展轴坐标系
@@ -9972,8 +10027,8 @@ std::string robot_command_thread::GetExAxisCoordWithID(std::string para){
     return std::string(std::to_string(res) + ","  + std::to_string(coord.tran.x) + "," + \
             std::to_string(coord.tran.y) + "," + std::to_string(coord.tran.z) + "," + \
             std::to_string(coord.rpy.rx) + "," + std::to_string(coord.rpy.ry) + "," + \
-            std::to_string(coord.rpy.rz));            
-} 
+            std::to_string(coord.rpy.rz));
+}
 
 /**
 * @brief 根据编号获取负载质量及质心
@@ -9993,8 +10048,8 @@ std::string robot_command_thread::GetTargetPayloadWithID(std::string para){
 
     int res = _ptr_robot->GetTargetPayloadWithID(id,weight,cog);
     return std::string(std::to_string(res) + "," + std::to_string(weight) + "," + std::to_string(cog.x) + "," +\
-                std::to_string(cog.y) + "," + std::to_string(cog.z));       
-} 
+                std::to_string(cog.y) + "," + std::to_string(cog.z));
+}
 
 /**
 * @brief 获取当前工具坐标系
@@ -10008,7 +10063,7 @@ std::string robot_command_thread::GetCurToolCoord(std::string para){
     return std::string(std::to_string(res) + ","  + std::to_string(coord.tran.x) + "," + \
             std::to_string(coord.tran.y) + "," + std::to_string(coord.tran.z) + "," + \
             std::to_string(coord.rpy.rx) + "," + std::to_string(coord.rpy.ry) + "," + \
-            std::to_string(coord.rpy.rz));            
+            std::to_string(coord.rpy.rz));
 }
 
 /**
@@ -10023,7 +10078,7 @@ std::string robot_command_thread::GetCurWObjCoord(std::string para){
     return std::string(std::to_string(res) + ","  + std::to_string(coord.tran.x) + "," + \
             std::to_string(coord.tran.y) + "," + std::to_string(coord.tran.z) + "," + \
             std::to_string(coord.rpy.rx) + "," + std::to_string(coord.rpy.ry) + "," + \
-            std::to_string(coord.rpy.rz));            
+            std::to_string(coord.rpy.rz));
 }
 
 /**
@@ -10038,7 +10093,7 @@ std::string robot_command_thread::GetCurExToolCoord(std::string para){
     return std::string(std::to_string(res) + ","  + std::to_string(coord.tran.x) + "," + \
             std::to_string(coord.tran.y) + "," + std::to_string(coord.tran.z) + "," + \
             std::to_string(coord.rpy.rx) + "," + std::to_string(coord.rpy.ry) + "," + \
-            std::to_string(coord.rpy.rz));            
+            std::to_string(coord.rpy.rz));
 }
 
 /**
@@ -10053,7 +10108,7 @@ std::string robot_command_thread::GetCurExAxisCoord(std::string para){
     return std::string(std::to_string(res) + ","  + std::to_string(coord.tran.x) + "," + \
             std::to_string(coord.tran.y) + "," + std::to_string(coord.tran.z) + "," + \
             std::to_string(coord.rpy.rx) + "," + std::to_string(coord.rpy.ry) + "," + \
-            std::to_string(coord.rpy.rz));            
+            std::to_string(coord.rpy.rz));
 }
 
 /**
@@ -10068,7 +10123,7 @@ std::string robot_command_thread::KernelUpgrade(std::string para){
     std::string filePath = list.front();list.pop_front();
 
     int res = _ptr_robot->KernelUpgrade(filePath);
-    return std::string(std::to_string(res));            
+    return std::string(std::to_string(res));
 }
 
 /**
@@ -10080,7 +10135,7 @@ std::string robot_command_thread::GetKernelUpgradeResult(std::string para){
     int result;
 
     int res = _ptr_robot->GetKernelUpgradeResult(result);
-    return std::string(std::to_string(res) + ","  + std::to_string(result));            
+    return std::string(std::to_string(res) + ","  + std::to_string(result));
 }
 
 /**
@@ -10125,8 +10180,8 @@ std::string robot_command_thread::CustomWeaveSetPara(std::string para){
     int stationary = std::stoi(list.front());list.pop_front();
 
     int res = _ptr_robot->CustomWeaveSetPara(id,pointNum,point,stayTime,frequency,incStayType,stationary);
-    return std::string(std::to_string(res));          
-} 
+    return std::string(std::to_string(res));
+}
 
 /**
  * @brief 获取自定义摆动参数
@@ -10174,8 +10229,8 @@ std::string robot_command_thread::CustomWeaveGetPara(std::string para){
                 std::to_string(stayTime[6]) + "," + std::to_string(stayTime[7]) + "," +\
                 std::to_string(stayTime[8]) + "," + std::to_string(stayTime[9]) + "," +\
                 std::to_string(frequency) + "," + std::to_string(incStayType) + "," +\
-                std::to_string(stationary));            
-} 
+                std::to_string(stationary));
+}
 
 /**
  * @brief 关节扭矩传感器灵敏度标定功能开启
@@ -10189,8 +10244,8 @@ std::string robot_command_thread::JointSensitivityEnable(std::string para){
     int status = std::stoi(list.front());list.pop_front();
 
     int res = _ptr_robot->JointSensitivityEnable(status);
-    return std::string(std::to_string(res));          
-} 
+    return std::string(std::to_string(res));
+}
 
 /**
  * @brief 获取关节扭矩传感器灵敏度标定结果
@@ -10209,8 +10264,8 @@ std::string robot_command_thread::JointSensitivityCalibration(std::string para){
                 std::to_string(calibResult[4]) + "," + std::to_string(calibResult[5]) + "," +\
                 std::to_string(linearity[0]) + "," + std::to_string(linearity[1]) + "," +\
                 std::to_string(linearity[2]) + "," + std::to_string(linearity[3]) + "," +\
-                std::to_string(linearity[4]) + "," + std::to_string(linearity[5]));            
-} 
+                std::to_string(linearity[4]) + "," + std::to_string(linearity[5]));
+}
 
 /**
  * @brief 关节扭矩传感器灵敏度数据采集
@@ -10219,8 +10274,8 @@ std::string robot_command_thread::JointSensitivityCalibration(std::string para){
 std::string robot_command_thread::JointSensitivityCollect(std::string para){
 
     int res = _ptr_robot->JointSensitivityCollect();
-    return std::string(std::to_string(res));            
-} 
+    return std::string(std::to_string(res));
+}
 
 std::string robot_command_thread::Sleep(std::string para){
     std::list<std::string> list;
@@ -10229,8 +10284,8 @@ std::string robot_command_thread::Sleep(std::string para){
     int ms = std::stoi(list.front());list.pop_front();
 
     int res = _ptr_robot->Sleep(ms);
-    return std::string(std::to_string(res));            
-} 
+    return std::string(std::to_string(res));
+}
 
 /**
  * @brief 清空运动指令队列
@@ -10239,15 +10294,15 @@ std::string robot_command_thread::Sleep(std::string para){
 std::string robot_command_thread::MotionQueueClear(std::string para){
 
     int res = _ptr_robot->MotionQueueClear();
-    return std::string(std::to_string(res));            
-} 
+    return std::string(std::to_string(res));
+}
 
 /**
  * @brief 获取机器人8个从站端口错误帧数
- * @param [out] inRecvErr 输入接收错误帧数 
- * @param [out] inCRCErr 输入CRC错误帧数 
- * @param [out] inTransmitErr 输入转发错误帧数 
- * @param [out] inLinkErr 输入链接错误帧数 
+ * @param [out] inRecvErr 输入接收错误帧数
+ * @param [out] inCRCErr 输入CRC错误帧数
+ * @param [out] inTransmitErr 输入转发错误帧数
+ * @param [out] inLinkErr 输入链接错误帧数
  * @param [out] outRecvErr 输出接收错误帧数
  * @param [out] outCRCErr 输出CRC错误帧数
  * @param [out] outTransmitErr 输出转发错误帧数
@@ -10290,8 +10345,8 @@ std::string robot_command_thread::GetSlavePortErrCounter(std::string para){
     for (int i = 0; i < 8; ++i) {
         out += "," + std::to_string(outLinkErr[i]);
     }
-    return out;        
-} 
+    return out;
+}
 
 /**
  * @brief 从站端口错误帧清零
@@ -10305,8 +10360,8 @@ std::string robot_command_thread::SlavePortErrCounterClear(std::string para){
     int slaveID = std::stoi(list.front());list.pop_front();
 
     int res = _ptr_robot->SlavePortErrCounterClear(slaveID);
-    return std::string(std::to_string(res));            
-} 
+    return std::string(std::to_string(res));
+}
 
 /**
  * @brief 设置各轴速度前馈系数
@@ -10326,8 +10381,8 @@ std::string robot_command_thread::SetVelFeedForwardRatio(std::string para){
     radio[5] = std::stod(list.front());list.pop_front();
 
     int res = _ptr_robot->SetVelFeedForwardRatio(radio);
-    return std::string(std::to_string(res));            
-} 
+    return std::string(std::to_string(res));
+}
 
 /**
  * @brief 获取各轴速度前馈系数
@@ -10341,7 +10396,7 @@ std::string robot_command_thread::GetVelFeedForwardRatio(std::string para){
     return std::string(std::to_string(res)  + "," +\
                 std::to_string(radio[0]) + "," + std::to_string(radio[1]) + "," +\
                 std::to_string(radio[2]) + "," + std::to_string(radio[3]) + "," +\
-                std::to_string(radio[4]) + "," + std::to_string(radio[5]));            
+                std::to_string(radio[4]) + "," + std::to_string(radio[5]));
 }
 
 /**
@@ -10351,8 +10406,8 @@ std::string robot_command_thread::GetVelFeedForwardRatio(std::string para){
 std::string robot_command_thread::RobotMCULogCollect(std::string para){
 
     int res = _ptr_robot->RobotMCULogCollect();
-    return std::string(std::to_string(res));            
-} 
+    return std::string(std::to_string(res));
+}
 
 /**
  * @brief 移动到相贯线起始点
@@ -10450,9 +10505,9 @@ std::string robot_command_thread::MoveToIntersectLineStart(std::string para){
         int moveType = std::stoi(list.front());list.pop_front();
 
         int res = _ptr_robot->MoveToIntersectLineStart(mainPoint,piecePoint,tool,wobj,vel,acc,ovl,oacc,moveType);
-        return std::string(std::to_string(res));   
-    }         
-} 
+        return std::string(std::to_string(res));
+    }
+}
 
 /**
  * @brief 相贯线运动
@@ -10552,8 +10607,8 @@ std::string robot_command_thread::MoveIntersectLine(std::string para){
         int moveDirection = std::stoi(list.front());list.pop_front();
 
         int res = _ptr_robot->MoveIntersectLine(mainPoint,piecePoint,tool,wobj,vel,acc,ovl,oacc,moveDirection);
-        return std::string(std::to_string(res));   
-    }         
+        return std::string(std::to_string(res));
+    }
 }
 /**
  * @brief 获取关节扭矩传感器迟滞误差
@@ -10567,7 +10622,7 @@ std::string robot_command_thread::JointHysteresisError(std::string para){
     return std::string(std::to_string(res)  + "," +\
                 std::to_string(hysteresisError[0]) + "," + std::to_string(hysteresisError[1]) + "," +\
                 std::to_string(hysteresisError[2]) + "," + std::to_string(hysteresisError[3]) + "," +\
-                std::to_string(hysteresisError[4]) + "," + std::to_string(hysteresisError[5]));            
+                std::to_string(hysteresisError[4]) + "," + std::to_string(hysteresisError[5]));
 }
 
 /**
@@ -10582,7 +10637,7 @@ std::string robot_command_thread::JointRepeatability(std::string para){
     return std::string(std::to_string(res)  + "," +\
                 std::to_string(repeatability[0]) + "," + std::to_string(repeatability[1]) + "," +\
                 std::to_string(repeatability[2]) + "," + std::to_string(repeatability[3]) + "," +\
-                std::to_string(repeatability[4]) + "," + std::to_string(repeatability[5]));            
+                std::to_string(repeatability[4]) + "," + std::to_string(repeatability[5]));
 }
 
 /**
@@ -10637,9 +10692,9 @@ std::string robot_command_thread::SetAdmittanceParams(std::string para){
     sensitivity[5] = std::stod(list.front());list.pop_front();
 
     int setZeroFlag = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->SetAdmittanceParams(M,B,K,threshold,sensitivity,setZeroFlag);
-    return std::string(std::to_string(res));            
+    return std::string(std::to_string(res));
 }
 
 /**
@@ -10691,7 +10746,7 @@ std::string robot_command_thread::TCPComputeRPY(std::string para){
 
     int res = _ptr_robot->TCPComputeRPY(Btool, Etool, sensor, radius, dz, TCPRPY);
     return std::string(std::to_string(res)  + "," + std::to_string(TCPRPY.rx) + "," +\
-            std::to_string(TCPRPY.ry) + "," + std::to_string(TCPRPY.rz));         
+            std::to_string(TCPRPY.ry) + "," + std::to_string(TCPRPY.rz));
 }
 
 /**
@@ -10733,7 +10788,7 @@ std::string robot_command_thread::TCPComputeXYZ(std::string para){
 
     int res = _ptr_robot->TCPComputeXYZ(select, originDirection, pos1, pos2, pos3, pos4, TCP);
     return std::string(std::to_string(res)  + "," + std::to_string(TCP.x) + "," +\
-            std::to_string(TCP.y) + "," + std::to_string(TCP.z));         
+            std::to_string(TCP.y) + "," + std::to_string(TCP.z));
 }
 
 	/**
@@ -10754,7 +10809,7 @@ std::string robot_command_thread::TCPRecordFlangePosStart(std::string para){
 	 */
 std::string robot_command_thread::TCPRecordFlangePosEnd(std::string para){
     para.clear();
-    
+
     int res = _ptr_robot->TCPRecordFlangePosEnd();
     return std::string(std::to_string(res));
 }
@@ -10766,10 +10821,10 @@ std::string robot_command_thread::TCPRecordFlangePosEnd(std::string para){
 	 */
 std::string robot_command_thread::TCPGetRecordFlangePos(std::string para){
     DescTran TCP;
-    
+
     int res = _ptr_robot->TCPGetRecordFlangePos(TCP);
     return std::string(std::to_string(res)  + "," + std::to_string(TCP.x) + "," +\
-            std::to_string(TCP.y) + "," + std::to_string(TCP.z));   
+            std::to_string(TCP.y) + "," + std::to_string(TCP.z));
 }
 
 /**
@@ -10778,7 +10833,7 @@ std::string robot_command_thread::TCPGetRecordFlangePos(std::string para){
  */
 std::string robot_command_thread::MoveStationary(std::string para){
     para.clear();
-    
+
     int res = _ptr_robot->MoveStationary();
     return std::string(std::to_string(res));
 }
@@ -10791,7 +10846,7 @@ std::string robot_command_thread::MoveStationary(std::string para){
  */
 std::string robot_command_thread::GetProgramRunErrCode(std::string para){
     para.clear();
-    
+
     int errLinNum;
     int luaErrCode;
     int res = _ptr_robot->GetProgramRunErrCode(errLinNum, luaErrCode);
@@ -10808,7 +10863,7 @@ std::string robot_command_thread::SetAxleGenComEnable(std::string para){
     _splitString2List(para,list);
 
     int mode = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->SetAxleGenComEnable(mode);
     return std::string(std::to_string(res));
 }
@@ -10828,7 +10883,7 @@ std::string robot_command_thread::GetAxleGenComCycleData(std::string para){
     for(int i = 0;i < len;i++){
         cycleData[i] = std::stoi(list.front());list.pop_front();
     }
-    
+
     int res = _ptr_robot->GetAxleGenComCycleData(len,cycleData);
     return std::string(std::to_string(res));
 }
@@ -10851,7 +10906,7 @@ std::string robot_command_thread::SndRcvAxleGenComCmdData(std::string para){
     for(int i = 0;i < lenSnd;i++){
         sndBuff[i] = std::stoi(list.front());list.pop_front();
     }
-    
+
     uint8_t lenRcv = std::stoi(list.front());list.pop_front();
 
     int rcvData[lenRcv];
@@ -10879,7 +10934,7 @@ std::string robot_command_thread::SetRobotStopOnComDisc(std::string para){
     int pordID = std::stoi(list.front());list.pop_front();
     int enable = std::stoi(list.front());list.pop_front();
     int confirmTime = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->SetRobotStopOnComDisc(pordID,enable,confirmTime);
     return std::string(std::to_string(res));
 }
@@ -10898,7 +10953,7 @@ std::string robot_command_thread::GetRobotStopOnComDisc(std::string para){
     int pordID = std::stoi(list.front());list.pop_front();
     bool enable;
     int confirmTime;
-    
+
     int res = _ptr_robot->GetRobotStopOnComDisc(pordID,enable,confirmTime);
     return std::string(std::to_string(res) + "," + std::to_string(enable) + "," +\
             std::to_string(confirmTime));
@@ -10916,7 +10971,7 @@ std::string robot_command_thread::SendUDPFrame(std::string para){
     std::string frame = list.front();list.pop_front();
 
     int res = _ptr_robot->SendUDPFrame(frame);
-    return std::string(std::to_string(res));            
+    return std::string(std::to_string(res));
 }
 
 /**
@@ -10935,8 +10990,8 @@ std::string robot_command_thread::SetVelReducePara(std::string para){
     int strategy = std::stoi(list.front());list.pop_front();
 
     int res = _ptr_robot->SetVelReducePara(enable,maxTCPVel,strategy);
-    return std::string(std::to_string(res));            
-} 
+    return std::string(std::to_string(res));
+}
 
 /**
  * @brief 定点摆动开始
@@ -10959,8 +11014,8 @@ std::string robot_command_thread::OriginPointWeaveStart(std::string para){
     double weaveTime = std::stod(list.front());list.pop_front();
 
     int res = _ptr_robot->OriginPointWeaveStart(weaveNum,mode,refPoint,weaveTime);
-    return std::string(std::to_string(res));            
-} 
+    return std::string(std::to_string(res));
+}
 
 /**
  * @brief 定点摆动结束
@@ -10968,8 +11023,8 @@ std::string robot_command_thread::OriginPointWeaveStart(std::string para){
  */
 std::string robot_command_thread::OriginPointWeaveEnd(std::string para){
     int res = _ptr_robot->OriginPointWeaveEnd();
-    return std::string(std::to_string(res));            
-} 
+    return std::string(std::to_string(res));
+}
 
 /**
  * @brief 设置用户自定义机器人末端灯色
@@ -10985,7 +11040,7 @@ std::string robot_command_thread::SetUserLEDColor(std::string para){
     int r = std::stoi(list.front());list.pop_front();
     int g = std::stoi(list.front());list.pop_front();
     int b = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->SetUserLEDColor(r,g,b);
     return std::string(std::to_string(res));
 }
@@ -11005,7 +11060,7 @@ std::string robot_command_thread::MoveToTPDStart(std::string para){
     list.front().copy(name,list.front().size());list.pop_front();
     uint8_t moveType = std::stoi(list.front());list.pop_front();
     float ovl = std::stod(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->MoveToTPDStart(name,moveType,ovl);
     return std::string(std::to_string(res));
 }
@@ -11020,7 +11075,7 @@ std::string robot_command_thread::SetRobotRealtimeStatePeriod(std::string para){
     _splitString2List(para,list);
 
     int period = std::stoi(list.front());list.pop_front();
-    
+
     int res = _ptr_robot->SetRobotRealtimeStatePeriod(period);
     return std::string(std::to_string(res));
 }
@@ -11065,45 +11120,45 @@ void robot_command_thread::_state_recv_callback(){
         msg.flange_c_cur_pos = ctrl_state.flange_cur_pos[5];
         msg.exaxispos1 = ctrl_state.extAxisStatus[0].pos;
         msg.exaxistatus1[0] = ctrl_state.extAxisStatus[0].errorCode;
-        msg.exaxistatus1[1] = ctrl_state.extAxisStatus[0].ready;      
-        msg.exaxistatus1[2] = ctrl_state.extAxisStatus[0].inPos;      
-        msg.exaxistatus1[3] = ctrl_state.extAxisStatus[0].alarm;      
-        msg.exaxistatus1[4] = ctrl_state.extAxisStatus[0].flerr;      
-        msg.exaxistatus1[5] = ctrl_state.extAxisStatus[0].nlimit;     
-        msg.exaxistatus1[6] = ctrl_state.extAxisStatus[0].pLimit;     
+        msg.exaxistatus1[1] = ctrl_state.extAxisStatus[0].ready;
+        msg.exaxistatus1[2] = ctrl_state.extAxisStatus[0].inPos;
+        msg.exaxistatus1[3] = ctrl_state.extAxisStatus[0].alarm;
+        msg.exaxistatus1[4] = ctrl_state.extAxisStatus[0].flerr;
+        msg.exaxistatus1[5] = ctrl_state.extAxisStatus[0].nlimit;
+        msg.exaxistatus1[6] = ctrl_state.extAxisStatus[0].pLimit;
         msg.exaxistatus1[7] = ctrl_state.extAxisStatus[0].mdbsOffLine;
         msg.exaxistatus1[8] = ctrl_state.extAxisStatus[0].mdbsTimeout;
         msg.exaxistatus1[9] = ctrl_state.extAxisStatus[0].homingStatus;
         msg.exaxispos2 = ctrl_state.extAxisStatus[1].pos;
         msg.exaxistatus2[0] = ctrl_state.extAxisStatus[1].errorCode;
-        msg.exaxistatus2[1] = ctrl_state.extAxisStatus[1].ready;      
-        msg.exaxistatus2[2] = ctrl_state.extAxisStatus[1].inPos;      
-        msg.exaxistatus2[3] = ctrl_state.extAxisStatus[1].alarm;      
-        msg.exaxistatus2[4] = ctrl_state.extAxisStatus[1].flerr;      
-        msg.exaxistatus2[5] = ctrl_state.extAxisStatus[1].nlimit;     
-        msg.exaxistatus2[6] = ctrl_state.extAxisStatus[1].pLimit;     
+        msg.exaxistatus2[1] = ctrl_state.extAxisStatus[1].ready;
+        msg.exaxistatus2[2] = ctrl_state.extAxisStatus[1].inPos;
+        msg.exaxistatus2[3] = ctrl_state.extAxisStatus[1].alarm;
+        msg.exaxistatus2[4] = ctrl_state.extAxisStatus[1].flerr;
+        msg.exaxistatus2[5] = ctrl_state.extAxisStatus[1].nlimit;
+        msg.exaxistatus2[6] = ctrl_state.extAxisStatus[1].pLimit;
         msg.exaxistatus2[7] = ctrl_state.extAxisStatus[1].mdbsOffLine;
         msg.exaxistatus2[8] = ctrl_state.extAxisStatus[1].mdbsTimeout;
         msg.exaxistatus2[9] = ctrl_state.extAxisStatus[1].homingStatus;
         msg.exaxispos3 = ctrl_state.extAxisStatus[2].pos;
         msg.exaxistatus3[0] = ctrl_state.extAxisStatus[2].errorCode;
-        msg.exaxistatus3[1] = ctrl_state.extAxisStatus[2].ready;      
-        msg.exaxistatus3[2] = ctrl_state.extAxisStatus[2].inPos;      
-        msg.exaxistatus3[3] = ctrl_state.extAxisStatus[2].alarm;      
-        msg.exaxistatus3[4] = ctrl_state.extAxisStatus[2].flerr;      
-        msg.exaxistatus3[5] = ctrl_state.extAxisStatus[2].nlimit;     
-        msg.exaxistatus3[6] = ctrl_state.extAxisStatus[2].pLimit;     
+        msg.exaxistatus3[1] = ctrl_state.extAxisStatus[2].ready;
+        msg.exaxistatus3[2] = ctrl_state.extAxisStatus[2].inPos;
+        msg.exaxistatus3[3] = ctrl_state.extAxisStatus[2].alarm;
+        msg.exaxistatus3[4] = ctrl_state.extAxisStatus[2].flerr;
+        msg.exaxistatus3[5] = ctrl_state.extAxisStatus[2].nlimit;
+        msg.exaxistatus3[6] = ctrl_state.extAxisStatus[2].pLimit;
         msg.exaxistatus3[7] = ctrl_state.extAxisStatus[2].mdbsOffLine;
         msg.exaxistatus3[8] = ctrl_state.extAxisStatus[2].mdbsTimeout;
         msg.exaxistatus3[9] = ctrl_state.extAxisStatus[2].homingStatus;
         msg.exaxispos4 = ctrl_state.extAxisStatus[3].pos;
         msg.exaxistatus4[0] = ctrl_state.extAxisStatus[3].errorCode;
-        msg.exaxistatus4[1] = ctrl_state.extAxisStatus[3].ready;      
-        msg.exaxistatus4[2] = ctrl_state.extAxisStatus[3].inPos;      
-        msg.exaxistatus4[3] = ctrl_state.extAxisStatus[3].alarm;      
-        msg.exaxistatus4[4] = ctrl_state.extAxisStatus[3].flerr;      
-        msg.exaxistatus4[5] = ctrl_state.extAxisStatus[3].nlimit;     
-        msg.exaxistatus4[6] = ctrl_state.extAxisStatus[3].pLimit;     
+        msg.exaxistatus4[1] = ctrl_state.extAxisStatus[3].ready;
+        msg.exaxistatus4[2] = ctrl_state.extAxisStatus[3].inPos;
+        msg.exaxistatus4[3] = ctrl_state.extAxisStatus[3].alarm;
+        msg.exaxistatus4[4] = ctrl_state.extAxisStatus[3].flerr;
+        msg.exaxistatus4[5] = ctrl_state.extAxisStatus[3].nlimit;
+        msg.exaxistatus4[6] = ctrl_state.extAxisStatus[3].pLimit;
         msg.exaxistatus4[7] = ctrl_state.extAxisStatus[3].mdbsOffLine;
         msg.exaxistatus4[8] = ctrl_state.extAxisStatus[3].mdbsTimeout;
         msg.exaxistatus4[9] = ctrl_state.extAxisStatus[3].homingStatus;
@@ -11263,7 +11318,7 @@ void robot_command_thread::_ping_recv_callback(){
         RCLCPP_INFO(rclcpp::get_logger(LOGGER_NAME),"192.168.58.2 is error: error_code=%d",state);
         msg.reconnect_flag = 1;
         _state_publisher->publish(msg);
-        
+
     }
 }
 
@@ -11271,4 +11326,324 @@ bool robot_command_thread::_check_ping(const std::string& ip_address) {
     std::string cmd = "ping -c 1 -W 1 " + ip_address + " > /dev/null 2>&1";
     int result = system(cmd.c_str());
     return (result == 0);
+}
+
+// ---------------------------------------------------------------------------
+// Velocity bridge callbacks
+// ---------------------------------------------------------------------------
+
+void robot_command_thread::_vel_bridge_joint_state_cb(const sensor_msgs::msg::JointState::SharedPtr msg)
+{
+    std::lock_guard<std::mutex> lock(_vel_bridge_mutex_);
+    for (size_t i = 0; i < msg->name.size(); i++) {
+        if (msg->name[i] == "j1") _vel_bridge_joint_state_pos_[0] = msg->position[i] * 180.0 / M_PI;
+        if (msg->name[i] == "j2") _vel_bridge_joint_state_pos_[1] = msg->position[i] * 180.0 / M_PI;
+        if (msg->name[i] == "j3") _vel_bridge_joint_state_pos_[2] = msg->position[i] * 180.0 / M_PI;
+        if (msg->name[i] == "j4") _vel_bridge_joint_state_pos_[3] = msg->position[i] * 180.0 / M_PI;
+        if (msg->name[i] == "j5") _vel_bridge_joint_state_pos_[4] = msg->position[i] * 180.0 / M_PI;
+        if (msg->name[i] == "j6") _vel_bridge_joint_state_pos_[5] = msg->position[i] * 180.0 / M_PI;
+    }
+    _vel_bridge_got_joint_state_ = true;
+}
+
+void robot_command_thread::_vel_bridge_cmd_cb(const trajectory_msgs::msg::JointTrajectoryPoint::SharedPtr msg)
+{
+    std::lock_guard<std::mutex> lock(_vel_bridge_mutex_);
+    _vel_bridge_latest_cmd_ = *msg;
+    _vel_bridge_has_cmd_ = true;
+    _vel_bridge_last_cmd_time_ = now();
+}
+
+void robot_command_thread::_vel_bridge_hold_cb(const std_msgs::msg::Empty::SharedPtr /*msg*/)
+{
+    std::lock_guard<std::mutex> lock(_vel_bridge_mutex_);
+    _vel_bridge_has_cmd_ = false;
+    RCLCPP_INFO(get_logger(), "Hold robot — stopping servo integration");
+}
+
+void robot_command_thread::_vel_bridge_control_loop()
+{
+    JointPos cmd;
+    ExaxisPos ext{0, 0, 0, 0};
+
+    // --- Measure actual timer period ---
+    rclcpp::Time loop_now = now();
+    if (_vel_bridge_last_loop_time_.seconds() > 0.0) {
+        _vel_bridge_measured_dt_ = (loop_now - _vel_bridge_last_loop_time_).seconds();
+    }
+    _vel_bridge_last_loop_time_ = loop_now;
+    _vel_bridge_loop_count_++;
+
+    {
+        std::lock_guard<std::mutex> lock(_vel_bridge_mutex_);
+
+        if (!_vel_bridge_has_cmd_) {
+            return;  // No command — do nothing
+        }
+
+        // Watchdog: if no command received within timeout, stop
+        if ((now() - _vel_bridge_last_cmd_time_).seconds() > _vel_bridge_watchdog_timeout_) {
+            _vel_bridge_has_cmd_ = false;
+            RCLCPP_WARN(get_logger(), "Velocity bridge watchdog timeout — stopping");
+            return;
+        }
+
+        // Track max per-step degree change for diagnostics
+        for (int i = 0; i < 6; i++) {
+            _vel_bridge_max_deg_step_[i] = 0.0;
+        }
+
+        // Integrate velocity -> position (velocities from diff_ik_node are in rad/s)
+        for (int i = 0; i < 6 && i < static_cast<int>(_vel_bridge_latest_cmd_.velocities.size()); i++) {
+            double vel_rad = _vel_bridge_latest_cmd_.velocities[i];
+            double step_deg = (vel_rad * 180.0 / M_PI) * _vel_bridge_dt_;
+            _vel_bridge_current_pos_[i] += step_deg;
+            _vel_bridge_max_deg_step_[i] = std::max(_vel_bridge_max_deg_step_[i], std::abs(step_deg));
+        }
+
+        // Drift correction: 1% pull towards /joint_states feedback
+        if (_vel_bridge_got_joint_state_) {
+            for (int i = 0; i < 6; i++) {
+                double drift = 0.01 * (_vel_bridge_joint_state_pos_[i] - _vel_bridge_current_pos_[i]);
+                _vel_bridge_current_pos_[i] += drift;
+            }
+        }
+
+        for (int i = 0; i < 6; i++) cmd.jPos[i] = _vel_bridge_current_pos_[i];
+    }
+
+    // --- Periodically log diagnostics (every ~100 iterations at 125Hz ≈ 0.8s) ---
+    if ((loop_now - _vel_bridge_last_log_time_).seconds() >= 2.0) {
+        _vel_bridge_last_log_time_ = loop_now;
+        RCLCPP_INFO(get_logger(),
+            "[VelBridge Diag] freq_target=%.1fHz | measured_dt=%.4fs (%.1fHz) | "
+            "ServoJ cmdT=%.4fs | vel_param=0 | max_step_deg=[%.4f %.4f %.4f %.4f %.4f %.4f]"
+            " | pos=[%.2f %.2f %.2f %.2f %.2f %.2f]",
+            1.0 / _vel_bridge_dt_,
+            _vel_bridge_measured_dt_,
+            _vel_bridge_measured_dt_ > 0.0 ? 1.0 / _vel_bridge_measured_dt_ : 0.0,
+            static_cast<float>(_vel_bridge_dt_),
+            _vel_bridge_max_deg_step_[0], _vel_bridge_max_deg_step_[1],
+            _vel_bridge_max_deg_step_[2], _vel_bridge_max_deg_step_[3],
+            _vel_bridge_max_deg_step_[4], _vel_bridge_max_deg_step_[5],
+            cmd.jPos[0], cmd.jPos[1], cmd.jPos[2],
+            cmd.jPos[3], cmd.jPos[4], cmd.jPos[5]);
+
+        // Convert max deg steps back to rad/s equivalent for readability
+        double max_deg_j1 = _vel_bridge_max_deg_step_[0] / _vel_bridge_measured_dt_;
+        double max_deg_j2 = _vel_bridge_max_deg_step_[1] / _vel_bridge_measured_dt_;
+        double max_deg_j3 = _vel_bridge_max_deg_step_[2] / _vel_bridge_measured_dt_;
+        double max_deg_j4 = _vel_bridge_max_deg_step_[3] / _vel_bridge_measured_dt_;
+        double max_deg_j5 = _vel_bridge_max_deg_step_[4] / _vel_bridge_measured_dt_;
+        double max_deg_j6 = _vel_bridge_max_deg_step_[5] / _vel_bridge_measured_dt_;
+        RCLCPP_INFO(get_logger(),
+            "[VelBridge Speed] vel_cmd_rad_s=[%.3f %.3f %.3f %.3f %.3f %.3f] "
+            "| implied_deg_s=[%.1f %.1f %.1f %.1f %.1f %.1f]",
+            _vel_bridge_latest_cmd_.velocities.size() >= 6
+                ? _vel_bridge_latest_cmd_.velocities[0] : 0.0,
+            _vel_bridge_latest_cmd_.velocities.size() >= 6
+                ? _vel_bridge_latest_cmd_.velocities[1] : 0.0,
+            _vel_bridge_latest_cmd_.velocities.size() >= 6
+                ? _vel_bridge_latest_cmd_.velocities[2] : 0.0,
+            _vel_bridge_latest_cmd_.velocities.size() >= 6
+                ? _vel_bridge_latest_cmd_.velocities[3] : 0.0,
+            _vel_bridge_latest_cmd_.velocities.size() >= 6
+                ? _vel_bridge_latest_cmd_.velocities[4] : 0.0,
+            _vel_bridge_latest_cmd_.velocities.size() >= 6
+                ? _vel_bridge_latest_cmd_.velocities[5] : 0.0,
+            max_deg_j1, max_deg_j2, max_deg_j3,
+            max_deg_j4, max_deg_j5, max_deg_j6);
+
+        _vel_bridge_loop_count_ = 0;
+    }
+
+    _ptr_robot->ServoJ(&cmd, &ext, 0, 0, static_cast<float>(_vel_bridge_dt_), 0, 0, 0, /*comType=*/1);
+}
+
+// ============================================================
+// Trajectory action server handlers (ServoJ streaming)
+// ============================================================
+
+rclcpp_action::GoalResponse robot_command_thread::_traj_handle_goal(
+    const rclcpp_action::GoalUUID & /*uuid*/,
+    std::shared_ptr<const FollowJT::Goal> /*goal*/)
+{
+    RCLCPP_INFO(get_logger(), "Trajectory action: goal received");
+    return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+}
+
+rclcpp_action::CancelResponse robot_command_thread::_traj_handle_cancel(
+    const std::shared_ptr<GoalHandleFollowJT> /*goal_handle*/)
+{
+    RCLCPP_WARN(get_logger(), "Trajectory action: cancel requested, calling StopMotion()");
+    _ptr_robot->StopMotion();
+    return rclcpp_action::CancelResponse::ACCEPT;
+}
+
+void robot_command_thread::_traj_handle_accepted(
+    const std::shared_ptr<GoalHandleFollowJT> goal_handle)
+{
+    auto goal = goal_handle->get_goal();
+    auto & traj = goal->trajectory;
+
+    if (traj.points.empty()) {
+        RCLCPP_ERROR(get_logger(), "Trajectory has 0 points, aborting");
+        auto result = std::make_shared<FollowJT::Result>();
+        goal_handle->abort(result);
+        return;
+    }
+
+    if (traj.points.size() == 1) {
+        // Single-point trajectory: succeed if already there, abort otherwise
+        JointPos actual;
+        int res = _ptr_robot->GetActualJointPosDegree(0, &actual);
+        if (res != 0) {
+            RCLCPP_ERROR(get_logger(), "GetActualJointPosDegree failed (%d), aborting", res);
+            auto result = std::make_shared<FollowJT::Result>();
+            goal_handle->abort(result);
+            return;
+        }
+
+        constexpr double kJointToleranceDeg = 0.5;
+        auto & pt = traj.points[0];
+        bool already_there = true;
+        for (size_t j = 0; j < 6 && j < pt.positions.size(); j++) {
+            double target_deg = pt.positions[j] * 180.0 / M_PI;
+            if (std::abs(actual.jPos[j] - target_deg) > kJointToleranceDeg) {
+                already_there = false;
+                break;
+            }
+        }
+
+        if (already_there) {
+            RCLCPP_INFO(get_logger(), "Single-point trajectory: already at target, succeeding");
+            auto result = std::make_shared<FollowJT::Result>();
+            goal_handle->succeed(result);
+        } else {
+            RCLCPP_ERROR(get_logger(), "Single-point trajectory: robot not at target, aborting");
+            auto result = std::make_shared<FollowJT::Result>();
+            goal_handle->abort(result);
+        }
+        return;
+    }
+
+    // Convert MoveIt trajectory (radians) → JointPos (degrees)
+    _traj_waypoints_.clear();
+    _traj_times_.clear();
+
+    for (auto & pt : traj.points) {
+        JointPos jp{};
+        for (size_t j = 0; j < 6 && j < pt.positions.size(); j++) {
+            jp.jPos[j] = pt.positions[j] * 180.0 / M_PI;
+        }
+        int t_ms = pt.time_from_start.sec * 1000 +
+                   static_cast<int>(pt.time_from_start.nanosec * 1e-6);
+        _traj_waypoints_.push_back(jp);
+        _traj_times_.push_back(t_ms);
+    }
+
+    double t_start_ms = static_cast<double>(_traj_times_.front());
+    double t_end_ms   = static_cast<double>(_traj_times_.back());
+    _traj_total_duration_s_ = (t_end_ms - t_start_ms) / 1000.0;
+
+    _traj_goal_handle_ = goal_handle;
+    _traj_idx_ = 0;
+    _traj_executing_ = true;
+    _traj_start_time_ = now();
+
+    int timer_ms = static_cast<int>(std::round(_traj_cmd_dt_ * 1000.0));
+    if (timer_ms < 1) timer_ms = 10;
+
+    RCLCPP_INFO(get_logger(), "Trajectory accepted: %zu waypoints, duration=%.3f s, cmd_dt=%d ms",
+                _traj_waypoints_.size(), _traj_total_duration_s_, timer_ms);
+
+    // Log original waypoints for reference
+    for (size_t i = 0; i < _traj_waypoints_.size(); i++) {
+        auto & jp = _traj_waypoints_[i];
+        RCLCPP_INFO(get_logger(),
+            "  wp[%zu]: t=%dms pos=[%.2f %.2f %.2f %.2f %.2f %.2f]",
+            i, _traj_times_[i],
+            jp.jPos[0], jp.jPos[1], jp.jPos[2], jp.jPos[3], jp.jPos[4], jp.jPos[5]);
+    }
+
+    // Start the streaming timer at _traj_cmd_dt_
+    auto timer_dt = std::chrono::milliseconds(timer_ms);
+    _traj_timer_ = create_wall_timer(
+        timer_dt, std::bind(&robot_command_thread::_traj_control_loop, this));
+}
+
+void robot_command_thread::_traj_control_loop()
+{
+    if (!_traj_executing_ || !_traj_goal_handle_) {
+        _traj_timer_->cancel();
+        return;
+    }
+
+    auto & goal_handle = _traj_goal_handle_;
+
+    // Check cancellation
+    if (goal_handle->is_canceling()) {
+        RCLCPP_WARN(get_logger(), "Trajectory cancelled mid-stream, stopping");
+        _ptr_robot->StopMotion();
+        auto result = std::make_shared<FollowJT::Result>();
+        goal_handle->abort(result);
+        _traj_executing_ = false;
+        _traj_timer_->cancel();
+        return;
+    }
+
+    // Compute elapsed time and interpolate on-the-fly
+    double elapsed_s = (now() - _traj_start_time_).seconds();
+    double frac = std::clamp(elapsed_s / _traj_total_duration_s_, 0.0, 1.0);
+
+    if (frac >= 1.0) {
+        // Send the final waypoint exactly, then succeed
+        JointPos & jp = _traj_waypoints_.back();
+        ExaxisPos ext{0, 0, 0, 0};
+        _ptr_robot->ServoJ(&jp, &ext, 100.0f, 100.0f,
+                           static_cast<float>(_traj_cmd_dt_), 0, 0, 0, /*comType=*/1);
+        RCLCPP_INFO(get_logger(), "Trajectory execution complete (%.3f s elapsed, %zu waypoints)",
+                    elapsed_s, _traj_waypoints_.size());
+        auto result = std::make_shared<FollowJT::Result>();
+        goal_handle->succeed(result);
+        _traj_executing_ = false;
+        _traj_timer_->cancel();
+        return;
+    }
+
+    // Interpolate: find the segment that contains frac
+    double total_t_ms = _traj_total_duration_s_ * 1000.0;
+    double t_ms = static_cast<double>(_traj_times_.front()) + frac * total_t_ms;
+
+    size_t seg = 0;
+    while (seg + 1 < _traj_times_.size() &&
+           static_cast<double>(_traj_times_[seg + 1]) < t_ms) {
+        seg++;
+    }
+
+    if (seg + 1 >= _traj_times_.size()) {
+        // At or past the last waypoint — should not happen due to frac <= 1 check
+        seg = _traj_times_.size() - 2;
+    }
+
+    double t0    = static_cast<double>(_traj_times_[seg]);
+    double t1    = static_cast<double>(_traj_times_[seg + 1]);
+    double alpha = (t1 - t0 > 0.0) ? (t_ms - t0) / (t1 - t0) : 0.0;
+    alpha = std::clamp(alpha, 0.0, 1.0);
+
+    JointPos cmd{};
+    for (int j = 0; j < 6; j++) {
+        double v0 = _traj_waypoints_[seg].jPos[j];
+        double v1 = _traj_waypoints_[seg + 1].jPos[j];
+        cmd.jPos[j] = v0 + alpha * (v1 - v0);
+    }
+
+    ExaxisPos ext{0, 0, 0, 0};
+    int ret = _ptr_robot->ServoJ(&cmd, &ext, 100.0f, 100.0f,
+                                 static_cast<float>(_traj_cmd_dt_), 0, 0, 0, /*comType=*/1);
+
+    if (ret != 0) {
+        RCLCPP_ERROR(get_logger(), "ServoJ error %d at t=%.3fs (seg=%zu, alpha=%.4f)",
+                     ret, elapsed_s, seg, alpha);
+    }
 }
