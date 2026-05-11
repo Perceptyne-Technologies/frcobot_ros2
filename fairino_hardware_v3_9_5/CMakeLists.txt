@@ -25,7 +25,7 @@ find_package(fairino_msgs REQUIRED)
 
 #set variable
 set(SRC_DIR EXP_SRC_DIR)
-file(GLOB SRC_DIR ./src/command_server.cpp ./src/command_server_node.cpp ./src/CNDE_thread.cpp ./src/global_val_def.cpp)
+file(GLOB SRC_DIR ./src/command_server.cpp ./src/command_server_node.cpp ./src/CNDE_thread.cpp ./src/global_val_def.cpp ./src/velocity_bridge_node.cpp)
 file(GLOB EXP_SRC_DIR ./examples/src/*.cpp)
 
 #compile
@@ -68,8 +68,9 @@ $<INSTALL_INTERFACE:include/fairino_hardware>
 # target_link_libraries(fairino_hardware ${CMAKE_CURRENT_SOURCE_DIR}/libfairino/lib/libfairino.so.2.3.0)
 
 # 链接库时添加rpath参数
-target_link_libraries(ros2_cmd_server "-Wl,-rpath,$ORIGIN" ${CMAKE_CURRENT_SOURCE_DIR}/libfairino/lib/libfairino.so.2.3.5)
-target_link_libraries(fairino_hardware "-Wl,-rpath,$ORIGIN" ${CMAKE_CURRENT_SOURCE_DIR}/libfairino/lib/libfairino.so.2.3.5)
+target_link_libraries(ros2_cmd_server "-Wl,-rpath,$ORIGIN" ${CMAKE_CURRENT_SOURCE_DIR}/libfairino/lib/libfairino.so.2.3.5 rt)
+target_link_libraries(fairino_hardware "-Wl,-rpath,$ORIGIN" ${CMAKE_CURRENT_SOURCE_DIR}/libfairino/lib/libfairino.so.2.3.5 rt)
+target_link_libraries(srv_test_client rt)
 
 #add dependencies
 ament_target_dependencies(ros2_cmd_server rclcpp rclcpp_action control_msgs fairino_msgs sensor_msgs trajectory_msgs std_msgs)

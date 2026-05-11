@@ -17,6 +17,7 @@
 #include "semaphore.h"
 #include <thread>
 #include <mutex>
+#include <unistd.h>
 
 
 /**

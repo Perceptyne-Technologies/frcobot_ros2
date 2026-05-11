@@ -47,4 +47,15 @@
     <disable_collisions link1="wrist1_link" link2="wrist2_link" reason="Adjacent"/>
     <disable_collisions link1="wrist1_link" link2="wrist3_link" reason="Never"/>
     <disable_collisions link1="wrist2_link" link2="wrist3_link" reason="Adjacent"/>
+    <disable_collisions link1="wrist3_link" link2="fr5_flat_base" reason="Never"/>    
+    <disable_collisions link1="wrist3_link" link2="fr5_deg10_base" reason="Never"/>
+    <disable_collisions link1="wrist3_link" link2="fr5_base" reason="Adjacent"/> 
+    <disable_collisions link1="fr5_base" link2="fr5_flat_base" reason="Adjacent"/>    
+    <disable_collisions link1="fr5_base" link2="fr5_deg10_base" reason="Adjacent"/>
+    <disable_collisions link1="fr5_base" link2="fr5_deg10_base" reason="Adjacent"/>   
+    <disable_collisions link1="wrist3_link" link2="fr5_deg10_base" reason="Never"/>
+    <disable_collisions link1="wrist3_link" link2="fr5_deg20_base" reason="Never"/> 
+    <disable_collisions link1="fr5_base" link2="fr5_deg20_base" reason="Adjacent"/>
+    <disable_collisions link1="fr5_base" link2="fr5_deg20_base" reason="Adjacent"/>   
+    <disable_collisions link1="wrist3_link" link2="fr5_deg20_base" reason="Never"/>
 </robot>

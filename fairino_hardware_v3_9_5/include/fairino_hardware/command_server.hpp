@@ -623,6 +623,7 @@ public:
     std::string MoveToTPDStart(std::string para);
     std::string SetRobotRealtimeStatePeriod(std::string para);
 
+    std::shared_ptr<FRRobot> _ptr_robot;//机械臂SDK库指针
 
 private:
 
@@ -637,7 +638,6 @@ private:
     bool _check_ping(const std::string& ip_address);
 
 
-    std::unique_ptr<FRRobot> _ptr_robot;//机械臂SDK库指针
     ROBOT_STATE_PKG _robot_realtime_state;//从SDK获取的机械臂实时状态结构体
     rclcpp::TimerBase::SharedPtr _locktimer;
 

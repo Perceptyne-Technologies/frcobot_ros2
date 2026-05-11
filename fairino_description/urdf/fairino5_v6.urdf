@@ -227,4 +227,234 @@
     <dynamics damping="0" friction="0" />
     <safety_controller soft_lower_limit="-3.0543" soft_upper_limit="3.0543" k_position="15" k_velocity="10" />
   </joint>
+  <joint name="fr5_attach_jt" type="fixed">
+    <origin xyz="0 0 0.1" rpy="0 0 1.5708"/>
+    <parent link="wrist3_link"/>
+    <child link="fr5_attach"/>
+  </joint>
+  <link name="fr5_attach">
+    <inertial>
+      <origin rpy="0.0 0.0 0.0" xyz="0.0 0.0 0.0"/>
+      <mass value="0.0"/>
+      <inertia ixx="1.218656252e-05" ixy="0.0" ixz="0.0" iyy="1.218656252e-05" iyz="0.0" izz="2.3765625e-05"/>
+    </inertial>
+  </link>
+  <joint name="fr5_ee_attach_jt" type="fixed">
+    <origin rpy="3.141592653589793 0 0"/>
+    <parent link="fr5_attach"/>
+    <child link="fr5_base"/>
+  </joint>
+  <link name="fr5_base">
+    <mass value="2.5"/>
+    <inertia ixx="0.014726666666666666" ixy="0" ixz="0" iyy="0.014726666666666666" iyz="0" izz="0.014726666666666666"/>
+    <visual>
+      <geometry>
+        <mesh filename="package://pr_description/meshes/pbf_mirror.stl"/>
+      </geometry>
+      <material name="dark_grey"/>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://pr_description/meshes/collision/pbf_mirror.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <!-- <joint name="fr5_joint8" type="revolute">
+    <origin rpy="0 -3.141592653589793 3.141592653589793" xyz="0 -0.1015 -0.2785"/>
+    <parent link="fr5_base"/>
+    <child link="fr5_ee_tip"/>
+    <limit effort="50" lower="-0.00000000001" upper="0.00000000001" velocity="0.000001"/>
+  </joint>
+  <link name="fr5_ee_tip">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0 0.0 0.0"/>
+      <mass value="0.0"/>
+      <inertia ixx="0.0" ixy="0.0" ixz="0.0" iyy="0.0" iyz="0.0" izz="0.0"/>
+    </inertial>
+  </link> -->
+  <joint name="fr5_bolting_tip_jt" type="fixed">
+    <origin rpy="0 3.141592653589793 3.141592653589793" xyz="-0.1015 -2.5e-05 -0.2855"/>
+    <parent link="fr5_base"/>
+    <child link="fr5_ee_tip_bolting"/>
+  </joint>
+  <link name="fr5_ee_tip_bolting">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0 0.0 0.0"/>
+      <mass value="0.0"/>
+      <inertia ixx="0.0" ixy="0.0" ixz="0.0" iyy="0.0" iyz="0.0" izz="0.0"/>
+    </inertial>
+  </link>
+  <joint name="fr5_ft_ee_tip_jt" type="fixed">
+    <origin rpy="0 3.141592653589793 3.141592653589793" xyz="0 0 -0.0395"/>
+    <parent link="fr5_base"/>
+    <child link="fr5_ft_ee_tip"/>
+  </joint>
+  <link name="fr5_ft_ee_tip">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0 0.0 0.0"/>
+      <mass value="0.0"/>
+      <inertia ixx="0.0" ixy="0.0" ixz="0.0" iyy="0.0" iyz="0.0" izz="0.0"/>
+    </inertial>
+  </link>
+  <!-- Attached camera flanges -->
+  <joint name="fr5_angled_attach_jt" type="fixed">
+    <origin rpy="0 0 -2.356194490192345" xyz="-0.053435 -0.053435 -0.0455"/>
+    <parent link="fr5_base"/>
+    <child link="fr5_angled_attach"/>
+  </joint>
+  <link name="fr5_angled_attach">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0 0.0 0.0"/>
+      <mass value="0.0"/>
+      <inertia ixx="0.0" ixy="0.0" ixz="0.0" iyy="0.0" iyz="0.0" izz="0.0"/>
+    </inertial>
+  </link>
+  <joint name="fr5_deg10_attach_jt" type="fixed">
+    <parent link="fr5_angled_attach"/>
+    <child link="fr5_deg10_base"/>
+  </joint>
+  <link name="fr5_deg10_base">
+    <inertia ixx="0.016666666666666666" ixy="0" ixz="0" iyy="0.016666666666666666" iyz="0" izz="0.016666666666666666"/>
+    <visual>
+      <geometry>
+        <mesh filename="package://pr_description/meshes/pbf_deg10.stl"/>
+      </geometry>
+      <material name="dark_grey"/>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://pr_description/meshes/collision/pbf_deg10.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="fr5_deg10_camera_jt" type="fixed">
+    <origin rpy="-2.9670597283903604 0 1.5707963267948966" xyz="0.069261 0.0 -0.021919"/>
+    <parent link="fr5_deg10_base"/>
+    <child link="fr5_deg10_camera_attach"/>
+  </joint>
+  <link name="fr5_deg10_camera_attach">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0 0.0 0.0"/>
+      <mass value="0.0"/>
+      <inertia ixx="0.0" ixy="0.0" ixz="0.0" iyy="0.0" iyz="0.0" izz="0.0"/>
+    </inertial>
+  </link>
+  <!-- TODO: Set this up, with proper depth sensor link -->
+  <joint name="fr5_deg10_ee_camera_attach_jt" type="fixed">
+    <parent link="fr5_deg10_camera_attach"/>
+    <child link="fr5_deg10_camera_body_link"/>
+  </joint>
+  <link name="fr5_deg10_camera_body_link">
+    <inertial>
+      <mass value="0.072"/>
+      <origin xyz="0 0 0"/>
+      <inertia ixx="0.003881243" ixy="0.0" ixz="0.0" iyy="0.000498940" iyz="0.0" izz="0.003879257"/>
+    </inertial>
+  </link>
+  <joint name="fr5_deg10_ee_camera_jt" type="fixed">
+    <origin rpy="1.5707963267948966 -1.5707963267948966 0.0" xyz="0 0.021 0.00835"/>
+    <!-- <origin xyz="${d405_zero_depth_to_glass + d405_glass_to_front} ${-d405_cam_depth_py} 0" rpy="${pi/2} 0 ${pi/2}"/> -->
+    <parent link="fr5_deg10_camera_body_link"/>
+    <child link="fr5_deg10_camera_base_link"/>
+  </joint>
+  <link name="fr5_deg10_camera_base_link">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0 0.0 0.0"/>
+      <mass value="0.0"/>
+      <inertia ixx="0.0" ixy="0.0" ixz="0.0" iyy="0.0" iyz="0.0" izz="0.0"/>
+    </inertial>
+  </link>
+  <joint name="fr5_deg10_ee_camera_base_jt" type="fixed">
+    <!-- <origin xyz="${d405_mesh_x_offset} ${d405_cam_depth_py} ${d405_cam_depth_pz}" rpy="${-pi/2} ${0} ${-pi/2}"/> -->
+    <origin rpy="0 0 0" xyz="0.01085 0.009 0.021"/>
+    <parent link="fr5_deg10_camera_base_link"/>
+    <child link="fr5_deg10_camera_link"/>
+  </joint>
+  <link name="fr5_deg10_camera_link">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0 0.0 0.0"/>
+      <mass value="0.0"/>
+      <inertia ixx="0.0" ixy="0.0" ixz="0.0" iyy="0.0" iyz="0.0" izz="0.0"/>
+    </inertial>
+  </link>
+  <joint name="fr5_opp_attach_jt" type="fixed">
+    <origin rpy="0 0 1.5707963267948966" xyz="0 0.072 -0.0455"/>
+    <parent link="fr5_base"/>
+    <child link="fr5_opp_attach"/>
+  </joint>
+  <link name="fr5_opp_attach">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0 0.0 0.0"/>
+      <mass value="0.0"/>
+      <inertia ixx="0.0" ixy="0.0" ixz="0.0" iyy="0.0" iyz="0.0" izz="0.0"/>
+    </inertial>
+  </link>
+  <joint name="fr5_deg20_attach_jt" type="fixed">
+    <parent link="fr5_opp_attach"/>
+    <child link="fr5_deg20_base"/>
+  </joint>
+  <link name="fr5_deg20_base">
+    <inertia ixx="0.016666666666666666" ixy="0" ixz="0" iyy="0.016666666666666666" iyz="0" izz="0.016666666666666666"/>
+    <visual>
+      <geometry>
+        <mesh filename="package://pr_description/meshes/pbf_deg20.stl"/>
+      </geometry>
+      <material name="dark_grey"/>
+    </visual>
+    <collision>
+      <geometry>
+        <mesh filename="package://pr_description/meshes/collision/pbf_deg20.stl"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="fr5_deg20_camera_jt" type="fixed">
+    <origin rpy="-2.792526803190927 0 1.5707963267948966" xyz="0.07011 -0.000747 -0.018489"/>
+    <parent link="fr5_deg20_base"/>
+    <child link="fr5_deg20_camera_attach"/>
+  </joint>
+  <link name="fr5_deg20_camera_attach">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0 0.0 0.0"/>
+      <mass value="0.0"/>
+      <inertia ixx="0.0" ixy="0.0" ixz="0.0" iyy="0.0" iyz="0.0" izz="0.0"/>
+    </inertial>
+  </link>
+  <!-- TODO: Set this up, with proper depth sensor link -->
+  <joint name="fr5_deg20_ee_camera_attach_jt" type="fixed">
+    <parent link="fr5_deg20_camera_attach"/>
+    <child link="fr5_deg20_camera_body_link"/>
+  </joint>
+  <link name="fr5_deg20_camera_body_link">
+    <inertial>
+      <mass value="0.072"/>
+      <origin xyz="0 0 0"/>
+      <inertia ixx="0.003881243" ixy="0.0" ixz="0.0" iyy="0.000498940" iyz="0.0" izz="0.003879257"/>
+    </inertial>
+  </link>
+  <joint name="fr5_deg20_ee_camera_jt" type="fixed">
+    <origin rpy="1.5707963267948966 -1.5707963267948966 0.0" xyz="0 0.021 0.00835"/>
+    <!-- <origin xyz="${d405_zero_depth_to_glass + d405_glass_to_front} ${-d405_cam_depth_py} 0" rpy="${pi/2} 0 ${pi/2}"/> -->
+    <parent link="fr5_deg20_camera_body_link"/>
+    <child link="fr5_deg20_camera_base_link"/>
+  </joint>
+  <link name="fr5_deg20_camera_base_link">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0 0.0 0.0"/>
+      <mass value="0.0"/>
+      <inertia ixx="0.0" ixy="0.0" ixz="0.0" iyy="0.0" iyz="0.0" izz="0.0"/>
+    </inertial>
+  </link>
+  <joint name="fr5_deg20_ee_camera_base_jt" type="fixed">
+    <!-- <origin xyz="${d405_mesh_x_offset} ${d405_cam_depth_py} ${d405_cam_depth_pz}" rpy="${-pi/2} ${0} ${-pi/2}"/> -->
+    <origin rpy="0 0 0" xyz="0.01085 0.009 0.021"/>
+    <parent link="fr5_deg20_camera_base_link"/>
+    <child link="fr5_deg20_camera_link"/>
+  </joint>
+  <link name="fr5_deg20_camera_link">
+    <inertial>
+      <origin rpy="0 0 0" xyz="0.0 0.0 0.0"/>
+      <mass value="0.0"/>
+      <inertia ixx="0.0" ixy="0.0" ixz="0.0" iyy="0.0" iyz="0.0" izz="0.0"/>
+    </inertial>
+  </link>
 </robot>

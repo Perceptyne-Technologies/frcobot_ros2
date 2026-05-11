@@ -6,6 +6,7 @@
 
 #include "rclcpp/rclcpp.hpp"
 #include "fairino_msgs/srv/remote_cmd_interface.hpp"
+#include <unistd.h>
 
 class srv_test_node:public rclcpp::Node{
 public:

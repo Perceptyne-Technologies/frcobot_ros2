@@ -222,7 +222,7 @@ robot_command_thread::robot_command_thread(const std::string node_name):rclcpp::
 
     //开始初始化
     int connect_count = 0;
-    _ptr_robot = std::make_unique<FRRobot>();
+    _ptr_robot = std::make_shared<FRRobot>();
     // _ptr_robot->SetReConnectParam(true,86400000,500);
     _ptr_robot->SetReConnectParam(true,86400000,500);
     _ptr_robot->LoggerInit(0,"/home/fairino/ros2_ws/fairino_SDK_log/cppsdk.log",5);
@@ -383,49 +383,6 @@ robot_command_thread::robot_command_thread(const std::string node_name):rclcpp::
      _locktimer1 = this->create_wall_timer(10ms,std::bind(&robot_command_thread::_state_recv_callback,this));//创建一个定时器任务用于获取非实时状态数据,触发间隔为100ms
      _locktimer2 = this->create_wall_timer(100ms,std::bind(&robot_command_thread::_ping_recv_callback,this));//创建一个定时器任务用于ping机器人,触发间隔为100ms
 
-     // --- Velocity bridge init ---
-     declare_parameter<std::string>("robot_name", "fr5");
-     declare_parameter<double>("velocity_command_freq", 125.0);
-
-     std::string robot_name = get_parameter("robot_name").as_string();
-     double freq = get_parameter("velocity_command_freq").as_double();
-     _vel_bridge_dt_ = 1.0 / freq;
-     _vel_bridge_cmd_topic_ = robot_name + "/command_move";
-     _vel_bridge_hold_topic_ = robot_name + "/hold_robot";
-
-     // Read initial joint positions
-     JointPos initial_pos;
-     _ptr_robot->GetActualJointPosDegree(0, &initial_pos);
-     for (int i = 0; i < 6; i++) {
-       _vel_bridge_current_pos_[i] = initial_pos.jPos[i];
-     }
-     RCLCPP_INFO(get_logger(), "Velocity bridge initial positions (deg): %.2f %.2f %.2f %.2f %.2f %.2f",
-                 _vel_bridge_current_pos_[0], _vel_bridge_current_pos_[1], _vel_bridge_current_pos_[2],
-                 _vel_bridge_current_pos_[3], _vel_bridge_current_pos_[4], _vel_bridge_current_pos_[5]);
-
-     // Start the UDP servo stream (velocity bridge uses UDP)
-     _ptr_robot->ServoMoveStart(/*comType=*/1);
-
-     // Subscriptions
-     _vel_bridge_joint_state_sub_ = create_subscription<sensor_msgs::msg::JointState>(
-       "/joint_states", rclcpp::QoS(2),
-       std::bind(&robot_command_thread::_vel_bridge_joint_state_cb, this, std::placeholders::_1));
-
-     _vel_bridge_cmd_sub_ = create_subscription<trajectory_msgs::msg::JointTrajectoryPoint>(
-       _vel_bridge_cmd_topic_, rclcpp::QoS(2),
-       std::bind(&robot_command_thread::_vel_bridge_cmd_cb, this, std::placeholders::_1));
-
-     _vel_bridge_hold_sub_ = create_subscription<std_msgs::msg::Empty>(
-       _vel_bridge_hold_topic_, rclcpp::QoS(1),
-       std::bind(&robot_command_thread::_vel_bridge_hold_cb, this, std::placeholders::_1));
-
-     // Control timer
-     auto dt_ms = std::chrono::milliseconds(static_cast<int>(1000.0 / freq));
-     _vel_bridge_timer_ = create_wall_timer(
-       dt_ms, std::bind(&robot_command_thread::_vel_bridge_control_loop, this));
-
-     RCLCPP_INFO(get_logger(), "Velocity bridge started — %s at %.1f Hz", _vel_bridge_cmd_topic_.c_str(), freq);
-
      // --- Trajectory action server ---
      _traj_action_server_ = rclcpp_action::create_server<FollowJT>(
          this, "fairino5_controller/follow_joint_trajectory",
@@ -443,8 +400,9 @@ robot_command_thread::robot_command_thread(const std::string node_name):rclcpp::
 robot_command_thread::~robot_command_thread()
 {
     // End the servo stream
-    _ptr_robot->ServoMoveEnd(/*comType=*/1);
-    _ptr_robot->CloseRPC();
+    // _ptr_robot->ServoMoveEnd(/*comType=*/1);
+    // _ptr_robot->CloseRPC();
+    _ptr_robot->~FRRobot();
 }
 
 
@@ -2591,10 +2549,10 @@ std::string robot_command_thread::TrajectoryJDelete(std::string para){
 }
 
 /**
- * @brief 加载轨迹J文件
+ * @brief Load trajectory J file
  * @param [in] para-name[30],ovl
- * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码
+ * @return whether the command executed successfully
+ * @retval 0-success, otherwise error code
  */
 std::string robot_command_thread::LoadTrajectoryJ(std::string para){
     //char name[30], float ovl
@@ -2607,9 +2565,9 @@ std::string robot_command_thread::LoadTrajectoryJ(std::string para){
 }
 
 /**
- * @brief 运行轨迹J文件
- * @return 指令执行是否成功
- * @retval 0-成功，其他-错误码
+ * @brief Execute trajectory J file
+ * @return whether the command executed successfully
+ * @retval 0-success, otherwise error code
  */
 std::string robot_command_thread::MoveTrajectoryJ(std::string para){
     //empty para
@@ -11302,7 +11260,7 @@ void robot_command_thread::_state_recv_callback(){
         RCLCPP_INFO(rclcpp::get_logger(LOGGER_NAME),"state feedback error: error_code=%d",res);
         msg.reconnect_flag = 1;
     }
-    _state_publisher->publish(msg);
+    // _state_publisher->publish(msg);
 }
 
 /**
@@ -11326,138 +11284,6 @@ bool robot_command_thread::_check_ping(const std::string& ip_address) {
     std::string cmd = "ping -c 1 -W 1 " + ip_address + " > /dev/null 2>&1";
     int result = system(cmd.c_str());
     return (result == 0);
-}
-
-// ---------------------------------------------------------------------------
-// Velocity bridge callbacks
-// ---------------------------------------------------------------------------
-
-void robot_command_thread::_vel_bridge_joint_state_cb(const sensor_msgs::msg::JointState::SharedPtr msg)
-{
-    std::lock_guard<std::mutex> lock(_vel_bridge_mutex_);
-    for (size_t i = 0; i < msg->name.size(); i++) {
-        if (msg->name[i] == "j1") _vel_bridge_joint_state_pos_[0] = msg->position[i] * 180.0 / M_PI;
-        if (msg->name[i] == "j2") _vel_bridge_joint_state_pos_[1] = msg->position[i] * 180.0 / M_PI;
-        if (msg->name[i] == "j3") _vel_bridge_joint_state_pos_[2] = msg->position[i] * 180.0 / M_PI;
-        if (msg->name[i] == "j4") _vel_bridge_joint_state_pos_[3] = msg->position[i] * 180.0 / M_PI;
-        if (msg->name[i] == "j5") _vel_bridge_joint_state_pos_[4] = msg->position[i] * 180.0 / M_PI;
-        if (msg->name[i] == "j6") _vel_bridge_joint_state_pos_[5] = msg->position[i] * 180.0 / M_PI;
-    }
-    _vel_bridge_got_joint_state_ = true;
-}
-
-void robot_command_thread::_vel_bridge_cmd_cb(const trajectory_msgs::msg::JointTrajectoryPoint::SharedPtr msg)
-{
-    std::lock_guard<std::mutex> lock(_vel_bridge_mutex_);
-    _vel_bridge_latest_cmd_ = *msg;
-    _vel_bridge_has_cmd_ = true;
-    _vel_bridge_last_cmd_time_ = now();
-}
-
-void robot_command_thread::_vel_bridge_hold_cb(const std_msgs::msg::Empty::SharedPtr /*msg*/)
-{
-    std::lock_guard<std::mutex> lock(_vel_bridge_mutex_);
-    _vel_bridge_has_cmd_ = false;
-    RCLCPP_INFO(get_logger(), "Hold robot — stopping servo integration");
-}
-
-void robot_command_thread::_vel_bridge_control_loop()
-{
-    JointPos cmd;
-    ExaxisPos ext{0, 0, 0, 0};
-
-    // --- Measure actual timer period ---
-    rclcpp::Time loop_now = now();
-    if (_vel_bridge_last_loop_time_.seconds() > 0.0) {
-        _vel_bridge_measured_dt_ = (loop_now - _vel_bridge_last_loop_time_).seconds();
-    }
-    _vel_bridge_last_loop_time_ = loop_now;
-    _vel_bridge_loop_count_++;
-
-    {
-        std::lock_guard<std::mutex> lock(_vel_bridge_mutex_);
-
-        if (!_vel_bridge_has_cmd_) {
-            return;  // No command — do nothing
-        }
-
-        // Watchdog: if no command received within timeout, stop
-        if ((now() - _vel_bridge_last_cmd_time_).seconds() > _vel_bridge_watchdog_timeout_) {
-            _vel_bridge_has_cmd_ = false;
-            RCLCPP_WARN(get_logger(), "Velocity bridge watchdog timeout — stopping");
-            return;
-        }
-
-        // Track max per-step degree change for diagnostics
-        for (int i = 0; i < 6; i++) {
-            _vel_bridge_max_deg_step_[i] = 0.0;
-        }
-
-        // Integrate velocity -> position (velocities from diff_ik_node are in rad/s)
-        for (int i = 0; i < 6 && i < static_cast<int>(_vel_bridge_latest_cmd_.velocities.size()); i++) {
-            double vel_rad = _vel_bridge_latest_cmd_.velocities[i];
-            double step_deg = (vel_rad * 180.0 / M_PI) * _vel_bridge_dt_;
-            _vel_bridge_current_pos_[i] += step_deg;
-            _vel_bridge_max_deg_step_[i] = std::max(_vel_bridge_max_deg_step_[i], std::abs(step_deg));
-        }
-
-        // Drift correction: 1% pull towards /joint_states feedback
-        if (_vel_bridge_got_joint_state_) {
-            for (int i = 0; i < 6; i++) {
-                double drift = 0.01 * (_vel_bridge_joint_state_pos_[i] - _vel_bridge_current_pos_[i]);
-                _vel_bridge_current_pos_[i] += drift;
-            }
-        }
-
-        for (int i = 0; i < 6; i++) cmd.jPos[i] = _vel_bridge_current_pos_[i];
-    }
-
-    // --- Periodically log diagnostics (every ~100 iterations at 125Hz ≈ 0.8s) ---
-    if ((loop_now - _vel_bridge_last_log_time_).seconds() >= 2.0) {
-        _vel_bridge_last_log_time_ = loop_now;
-        RCLCPP_INFO(get_logger(),
-            "[VelBridge Diag] freq_target=%.1fHz | measured_dt=%.4fs (%.1fHz) | "
-            "ServoJ cmdT=%.4fs | vel_param=0 | max_step_deg=[%.4f %.4f %.4f %.4f %.4f %.4f]"
-            " | pos=[%.2f %.2f %.2f %.2f %.2f %.2f]",
-            1.0 / _vel_bridge_dt_,
-            _vel_bridge_measured_dt_,
-            _vel_bridge_measured_dt_ > 0.0 ? 1.0 / _vel_bridge_measured_dt_ : 0.0,
-            static_cast<float>(_vel_bridge_dt_),
-            _vel_bridge_max_deg_step_[0], _vel_bridge_max_deg_step_[1],
-            _vel_bridge_max_deg_step_[2], _vel_bridge_max_deg_step_[3],
-            _vel_bridge_max_deg_step_[4], _vel_bridge_max_deg_step_[5],
-            cmd.jPos[0], cmd.jPos[1], cmd.jPos[2],
-            cmd.jPos[3], cmd.jPos[4], cmd.jPos[5]);
-
-        // Convert max deg steps back to rad/s equivalent for readability
-        double max_deg_j1 = _vel_bridge_max_deg_step_[0] / _vel_bridge_measured_dt_;
-        double max_deg_j2 = _vel_bridge_max_deg_step_[1] / _vel_bridge_measured_dt_;
-        double max_deg_j3 = _vel_bridge_max_deg_step_[2] / _vel_bridge_measured_dt_;
-        double max_deg_j4 = _vel_bridge_max_deg_step_[3] / _vel_bridge_measured_dt_;
-        double max_deg_j5 = _vel_bridge_max_deg_step_[4] / _vel_bridge_measured_dt_;
-        double max_deg_j6 = _vel_bridge_max_deg_step_[5] / _vel_bridge_measured_dt_;
-        RCLCPP_INFO(get_logger(),
-            "[VelBridge Speed] vel_cmd_rad_s=[%.3f %.3f %.3f %.3f %.3f %.3f] "
-            "| implied_deg_s=[%.1f %.1f %.1f %.1f %.1f %.1f]",
-            _vel_bridge_latest_cmd_.velocities.size() >= 6
-                ? _vel_bridge_latest_cmd_.velocities[0] : 0.0,
-            _vel_bridge_latest_cmd_.velocities.size() >= 6
-                ? _vel_bridge_latest_cmd_.velocities[1] : 0.0,
-            _vel_bridge_latest_cmd_.velocities.size() >= 6
-                ? _vel_bridge_latest_cmd_.velocities[2] : 0.0,
-            _vel_bridge_latest_cmd_.velocities.size() >= 6
-                ? _vel_bridge_latest_cmd_.velocities[3] : 0.0,
-            _vel_bridge_latest_cmd_.velocities.size() >= 6
-                ? _vel_bridge_latest_cmd_.velocities[4] : 0.0,
-            _vel_bridge_latest_cmd_.velocities.size() >= 6
-                ? _vel_bridge_latest_cmd_.velocities[5] : 0.0,
-            max_deg_j1, max_deg_j2, max_deg_j3,
-            max_deg_j4, max_deg_j5, max_deg_j6);
-
-        _vel_bridge_loop_count_ = 0;
-    }
-
-    _ptr_robot->ServoJ(&cmd, &ext, 0, 0, static_cast<float>(_vel_bridge_dt_), 0, 0, 0, /*comType=*/1);
 }
 
 // ============================================================

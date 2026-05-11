@@ -5,7 +5,7 @@ Panels:
     Property Tree Widget:
       Expanded: ~
       Splitter Ratio: 0.5
-    Tree Height: 347
+    Tree Height: 344
   - Class: rviz_common/Help
     Name: Help
   - Class: rviz_common/Views
@@ -36,7 +36,7 @@ Visualization Manager:
       Plane Cell Count: 10
       Reference Frame: <Fixed Frame>
       Value: true
-    - Acceleration_Scaling_Factor: 1
+    - Acceleration_Scaling_Factor: 0.01
       Class: moveit_rviz_plugin/MotionPlanning
       Enabled: true
       Move Group Namespace: ""
@@ -81,6 +81,73 @@ Visualization Manager:
             Show Axes: false
             Show Trail: false
             Value: true
+          fr5_angled_attach:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          fr5_attach:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          fr5_base:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          fr5_deg10_base:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          fr5_deg10_camera_attach:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          fr5_deg10_camera_base_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          fr5_deg10_camera_body_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          fr5_deg10_camera_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          fr5_deg20_base:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          fr5_deg20_camera_attach:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          fr5_deg20_camera_base_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          fr5_deg20_camera_body_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          fr5_deg20_camera_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          fr5_ee_tip_bolting:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          fr5_ft_ee_tip:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          fr5_opp_attach:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
           shoulder_link:
             Alpha: 1
             Show Axes: false
@@ -166,6 +233,73 @@ Visualization Manager:
             Show Axes: false
             Show Trail: false
             Value: true
+          fr5_angled_attach:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          fr5_attach:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          fr5_base:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          fr5_deg10_base:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          fr5_deg10_camera_attach:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          fr5_deg10_camera_base_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          fr5_deg10_camera_body_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          fr5_deg10_camera_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          fr5_deg20_base:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          fr5_deg20_camera_attach:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          fr5_deg20_camera_base_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          fr5_deg20_camera_body_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          fr5_deg20_camera_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          fr5_ee_tip_bolting:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          fr5_ft_ee_tip:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          fr5_opp_attach:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
           shoulder_link:
             Alpha: 1
             Show Axes: false
@@ -195,9 +329,11 @@ Visualization Manager:
         Show Robot Collision: false
         Show Robot Visual: true
       Value: true
-      Velocity_Scaling_Factor: 1
+      Velocity_Scaling_Factor: 0.01
     - Class: rviz_default_plugins/TF
       Enabled: true
+      Filter (blacklist): ""
+      Filter (whitelist): ""
       Frame Timeout: 15
       Frames:
         All Enabled: false
@@ -207,16 +343,46 @@ Visualization Manager:
           Value: false
         forearm_link:
           Value: false
-        right_camera_color_frame:
-          Value: false
-        right_camera_color_optical_frame:
-          Value: false
-        right_camera_depth_frame:
-          Value: false
-        right_camera_depth_optical_frame:
-          Value: false
-        right_camera_link:
-          Value: false
+        fr5_angled_attach:
+          Value: true
+        fr5_attach:
+          Value: true
+        fr5_base:
+          Value: true
+        fr5_deg10_base:
+          Value: true
+        fr5_deg10_camera_attach:
+          Value: true
+        fr5_deg10_camera_base_link:
+          Value: true
+        fr5_deg10_camera_body_link:
+          Value: true
+        fr5_deg10_camera_color_frame:
+          Value: true
+        fr5_deg10_camera_color_optical_frame:
+          Value: true
+        fr5_deg10_camera_depth_frame:
+          Value: true
+        fr5_deg10_camera_depth_optical_frame:
+          Value: true
+        fr5_deg10_camera_link:
+          Value: true
+        fr5_deg20_base:
+          Value: true
+        fr5_deg20_camera_attach:
+          Value: true
+        fr5_deg20_camera_base_link:
+          Value: true
+        fr5_deg20_camera_body_link:
+          Value: true
+        fr5_deg20_camera_link:
+          Value: true
+        fr5_ee_tip_bolting:
+          Value: true
+        fr5_ft_ee_tip:
+          Value: true
+        fr5_opp_attach:
+          Value: true
         shoulder_link:
           Value: false
         upperarm_link:
@@ -241,7 +407,31 @@ Visualization Manager:
                   wrist1_link:
                     wrist2_link:
                       wrist3_link:
-                        {}
+                        fr5_attach:
+                          fr5_base:
+                            fr5_angled_attach:
+                              fr5_deg10_base:
+                                fr5_deg10_camera_attach:
+                                  fr5_deg10_camera_body_link:
+                                    fr5_deg10_camera_base_link:
+                                      fr5_deg10_camera_link:
+                                        fr5_deg10_camera_color_frame:
+                                          fr5_deg10_camera_color_optical_frame:
+                                            {}
+                                        fr5_deg10_camera_depth_frame:
+                                          fr5_deg10_camera_depth_optical_frame:
+                                            {}
+                            fr5_ee_tip_bolting:
+                              {}
+                            fr5_ft_ee_tip:
+                              {}
+                            fr5_opp_attach:
+                              fr5_deg20_base:
+                                fr5_deg20_camera_attach:
+                                  fr5_deg20_camera_body_link:
+                                    fr5_deg20_camera_base_link:
+                                      fr5_deg20_camera_link:
+                                        {}
       Update Interval: 0
       Value: true
   Enabled: true
@@ -262,7 +452,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 1.3592569828033447
+      Distance: 2.138817310333252
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -277,15 +467,15 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 1.0700000524520874
+      Pitch: 0.5900004506111145
       Target Frame: base_link
       Value: Orbit (rviz_default_plugins)
-      Yaw: 2.9951815605163574
+      Yaw: 4.630181312561035
     Saved: ~
 Window Geometry:
   Displays:
     collapsed: false
-  Height: 1016
+  Height: 1011
   Help:
     collapsed: false
   Hide Left Dock: false
@@ -296,9 +486,9 @@ Window Geometry:
     collapsed: false
   MotionPlanning - Trajectory Slider:
     collapsed: false
-  QMainWindow State: 000000ff00000000fd0000000200000000000001f30000039efc0200000005fb00000044004d006f00740069006f006e0050006c0061006e006e0069006e00670020002d0020005400720061006a006500630074006f0072007900200053006c00690064006500720000000000ffffffff0000004100fffffffb000000100044006900730070006c006100790073010000003d000001de000000c900fffffffb0000001c004d006f00740069006f006e0050006c0061006e006e0069006e00670100000221000001ba0000017d00fffffffb0000000800480065006c0070000000029a0000006e0000006e00fffffffb0000000a00560069006500770073000000031d000000be000000a400ffffff00000001000001900000039efc0200000001fb00000012004d00610069006e00500061006e0065006c010000003d0000039e000001fc00ffffff000003ab0000039e00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  QMainWindow State: 000000ff00000000fd0000000200000000000001f300000399fc0200000005fb00000044004d006f00740069006f006e0050006c0061006e006e0069006e00670020002d0020005400720061006a006500630074006f0072007900200053006c00690064006500720000000000ffffffff0000004100fffffffb000000100044006900730070006c006100790073010000003d000001db000000c900fffffffb0000001c004d006f00740069006f006e0050006c0061006e006e0069006e0067010000021e000001b80000017d00fffffffb0000000800480065006c0070000000029a0000006e0000006e00fffffffb0000000a00560069006500770073000000031d000000be000000a400ffffff000000010000019000000399fc0200000001fb00000012004d00610069006e00500061006e0065006c010000003d00000399000001fc00ffffff000003af0000039900000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Views:
     collapsed: false
-  Width: 1850
-  X: 70
-  Y: 27
+  Width: 1854
+  X: 66
+  Y: 32
