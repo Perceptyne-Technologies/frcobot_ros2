@@ -203,8 +203,7 @@ void VelocityBridge::controlLoop()
       cmd.jPos[i] = current_positions_[i];
     }
 
-    RCLCPP_INFO(get_logger(), "Velocity sending: ");
+    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 3000, "Velocity sending");
     ptr_robot_->ServoJ(&cmd, &ext, 0, 0, static_cast<float>(dt_), 0, 0, 0, 1);
-    RCLCPP_INFO(get_logger(), "Velocity sent");
   }
 }
